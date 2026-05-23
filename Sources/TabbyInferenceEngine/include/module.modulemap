@@ -1,0 +1,5 @@
+module TabbyInference {
+    header "TabbyInferenceEngine.h"
+    requires cplusplus
+    export *
+}

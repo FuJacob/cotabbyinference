@@ -1,26 +1,37 @@
 // swift-tools-version: 6.2
-// The swift-tools-version declares the minimum version of Swift required to build this package.
 
 import PackageDescription
 
 let package = Package(
-    name: "LlamaMiddleware",
+    name: "TabbyInference",
+    platforms: [.macOS(.v14)],
     products: [
-        // Products define the executables and libraries a package produces, making them visible to other packages.
         .library(
-            name: "LlamaMiddleware",
-            targets: ["LlamaMiddleware"]
+            name: "TabbyInference",
+            targets: ["TabbyInferenceEngine"]
         ),
     ],
     targets: [
-        // Targets are the basic building blocks of a package, defining a module or a test suite.
-        // Targets can depend on other targets in this package and products from dependencies.
+        .binaryTarget(
+            name: "llama-cpp",
+            url: "https://github.com/ggml-org/llama.cpp/releases/download/b8665/llama-b8665-xcframework.zip",
+            checksum: "5279c975a0ad136eb0ca29bb6390735b949bc0bed0f803124538e341315cb8f7"
+        ),
         .target(
-            name: "LlamaMiddleware"
+            name: "TabbyInferenceEngine",
+            dependencies: ["llama-cpp"],
+            path: "Sources/TabbyInferenceEngine",
+            publicHeadersPath: "include",
+            cxxSettings: [
+                .unsafeFlags(["-std=c++17"]),
+            ]
         ),
         .testTarget(
-            name: "LlamaMiddlewareTests",
-            dependencies: ["LlamaMiddleware"]
+            name: "TabbyInferenceTests",
+            dependencies: ["TabbyInferenceEngine"],
+            swiftSettings: [
+                .interoperabilityMode(.Cxx),
+            ]
         ),
     ]
 )
