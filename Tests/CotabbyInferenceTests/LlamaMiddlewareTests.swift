@@ -70,7 +70,7 @@ final class LlamaMiddlewareTests: XCTestCase {
     }
 
     func testEndToEndWithModel() throws {
-        let modelPath = "/Users/jacobfu/Library/Application Support/cotabby/LlamaRuntime/Qwen3-0.6B-Q4_K_M.gguf"
+        let modelPath = "/Users/jacobfu/Library/Application Support/tabby/LlamaRuntime/Qwen3-0.6B-Q4_K_M.gguf"
         guard FileManager.default.fileExists(atPath: modelPath) else {
             throw XCTSkip("Test model not found at \(modelPath)")
         }
