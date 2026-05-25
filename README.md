@@ -1,6 +1,6 @@
-# TabbyInference
+# CotabbyInference
 
-A C++ inference engine wrapping [llama.cpp](https://github.com/ggml-org/llama.cpp) for on-device LLM inference on macOS, designed for [Tabby](https://github.com/nicktrienenern/Tabby).
+A C++ inference engine wrapping [llama.cpp](https://github.com/ggml-org/llama.cpp) for on-device LLM inference on macOS, designed for [Cotabby](https://github.com/nicktrienenern/Cotabby).
 
 [![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
@@ -12,17 +12,17 @@ A C++ inference engine wrapping [llama.cpp](https://github.com/ggml-org/llama.cp
 
 ## Installation
 
-Add TabbyInference to your `Package.swift`:
+Add CotabbyInference to your `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/FuJacob/tabbyinference.git", from: "0.1.0"),
+    .package(url: "https://github.com/FuJacob/cotabbyinference.git", from: "0.1.0"),
 ],
 targets: [
     .target(
         name: "YourTarget",
         dependencies: [
-            .product(name: "TabbyInference", package: "tabbyinference"),
+            .product(name: "CotabbyInference", package: "cotabbyinference"),
         ],
         swiftSettings: [
             .interoperabilityMode(.Cxx),
@@ -34,9 +34,9 @@ targets: [
 ## Usage
 
 ```swift
-import TabbyInference
+import CotabbyInference
 
-var engine = TabbyInferenceEngine()
+var engine = CotabbyInferenceEngine()
 
 // Load a GGUF model (-1 for all GPU layers, 2048 context, 512 batch)
 let status = engine.loadModel("/path/to/model.gguf", -1, 2048, 512)
@@ -87,7 +87,7 @@ engine.unloadModel()
 
 Each sequence gets its own `llama_context` and sampler chain -- fully independent lifetimes, clean cancellation, no shared decode mutex. The engine supports up to 4 concurrent sequences.
 
-The public C++ API uses PIMPL to keep `llama.h` out of the public header, so consumers only link against the `TabbyInference` module.
+The public C++ API uses PIMPL to keep `llama.h` out of the public header, so consumers only link against the `CotabbyInference` module.
 
 ## License
 

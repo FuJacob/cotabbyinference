@@ -28,16 +28,16 @@ enum class EngineStatus : int {
     not_loaded = 3,
 };
 
-class TabbyInferenceEngine {
+class CotabbyInferenceEngine {
 public:
-    TabbyInferenceEngine();
-    ~TabbyInferenceEngine();
+    CotabbyInferenceEngine();
+    ~CotabbyInferenceEngine();
 
     // Move-only (owns native resources via PIMPL)
-    TabbyInferenceEngine(TabbyInferenceEngine&& other) noexcept;
-    TabbyInferenceEngine& operator=(TabbyInferenceEngine&&) = delete;
-    TabbyInferenceEngine(const TabbyInferenceEngine&) = delete;
-    TabbyInferenceEngine& operator=(const TabbyInferenceEngine&) = delete;
+    CotabbyInferenceEngine(CotabbyInferenceEngine&& other) noexcept;
+    CotabbyInferenceEngine& operator=(CotabbyInferenceEngine&&) = delete;
+    CotabbyInferenceEngine(const CotabbyInferenceEngine&) = delete;
+    CotabbyInferenceEngine& operator=(const CotabbyInferenceEngine&) = delete;
 
     // Model lifecycle
     EngineStatus loadModel(const char* path, int gpu_layers,

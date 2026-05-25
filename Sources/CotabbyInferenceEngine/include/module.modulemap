@@ -1,0 +1,5 @@
+module CotabbyInference {
+    header "CotabbyInferenceEngine.h"
+    requires cplusplus
+    export *
+}

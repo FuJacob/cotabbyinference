@@ -1,29 +1,29 @@
 import XCTest
-import TabbyInference
+import CotabbyInference
 
 final class LlamaMiddlewareTests: XCTestCase {
 
     func testEngineStartsUnloaded() {
-        let engine = TabbyInferenceEngine()
+        let engine = CotabbyInferenceEngine()
         XCTAssertFalse(engine.isModelLoaded())
     }
 
     func testUnloadWhenNothingLoadedIsIdempotent() {
-        var engine = TabbyInferenceEngine()  // var: unloadModel mutates
+        var engine = CotabbyInferenceEngine()  // var: unloadModel mutates
         engine.unloadModel()
         engine.unloadModel()
         XCTAssertFalse(engine.isModelLoaded())
     }
 
     func testLoadModelWithBadPathReturnsError() {
-        var engine = TabbyInferenceEngine()
+        var engine = CotabbyInferenceEngine()
         let status = engine.loadModel("/nonexistent/path.gguf", -1, 2048, 512)
         XCTAssertEqual(status, EngineStatus.error)
         XCTAssertFalse(engine.isModelLoaded())
     }
 
     func testCreateSequenceWithoutModelReturnsMinus1() {
-        var engine = TabbyInferenceEngine()
+        var engine = CotabbyInferenceEngine()
         let config = SamplingConfig(
             max_prediction_tokens: 8,
             temperature: 0.1,
@@ -38,44 +38,44 @@ final class LlamaMiddlewareTests: XCTestCase {
     }
 
     func testDestroySequenceWithInvalidIdDoesNotCrash() {
-        var engine = TabbyInferenceEngine()
+        var engine = CotabbyInferenceEngine()
         engine.destroySequence(999)
         engine.destroySequence(-1)
     }
 
     func testCancelSequenceWithInvalidIdDoesNotCrash() {
-        var engine = TabbyInferenceEngine()
+        var engine = CotabbyInferenceEngine()
         engine.cancelSequence(999)
     }
 
     func testTokenizeWithoutModelReturnsEmpty() {
-        let engine = TabbyInferenceEngine()
+        let engine = CotabbyInferenceEngine()
         let text = "hello"
         let tokens = engine.tokenize(text, Int32(text.utf8.count))
         XCTAssertTrue(tokens.isEmpty)
     }
 
     func testDiagnosticsDefaultToZero() {
-        let engine = TabbyInferenceEngine()
+        let engine = CotabbyInferenceEngine()
         XCTAssertEqual(engine.getContextWindowTokens(), 0)
         XCTAssertEqual(engine.getBatchSize(), 0)
         XCTAssertEqual(engine.getGPULayerCount(), 0)
     }
 
     func testDecodePromptWithoutModelReturnsNotLoaded() {
-        var engine = TabbyInferenceEngine()
+        var engine = CotabbyInferenceEngine()
         var tokens: [Int32] = [1, 2, 3]
         let status = engine.decodePrompt(1, &tokens, Int32(tokens.count), 0)
         XCTAssertEqual(status, EngineStatus.not_loaded)
     }
 
     func testEndToEndWithModel() throws {
-        let modelPath = "/Users/jacobfu/Library/Application Support/tabby/LlamaRuntime/Qwen3-0.6B-Q4_K_M.gguf"
+        let modelPath = "/Users/jacobfu/Library/Application Support/cotabby/LlamaRuntime/Qwen3-0.6B-Q4_K_M.gguf"
         guard FileManager.default.fileExists(atPath: modelPath) else {
             throw XCTSkip("Test model not found at \(modelPath)")
         }
 
-        var engine = TabbyInferenceEngine()
+        var engine = CotabbyInferenceEngine()
 
         // Load
         let loadStatus = engine.loadModel(modelPath, -1, 2048, 512)

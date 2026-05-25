@@ -1,4 +1,4 @@
-#include "TabbyInferenceEngine.h"
+#include "CotabbyInferenceEngine.h"
 
 #include <atomic>
 #include <cstring>
@@ -47,7 +47,7 @@ struct SequenceState {
 // PIMPL
 // ---------------------------------------------------------------------------
 
-struct TabbyInferenceEngine::Impl {
+struct CotabbyInferenceEngine::Impl {
     static constexpr int MAX_SEQUENCES = 4;
     static constexpr llama_seq_id SEQ_ID = 0;
 
@@ -144,14 +144,14 @@ struct TabbyInferenceEngine::Impl {
 // Construction / Destruction
 // ---------------------------------------------------------------------------
 
-TabbyInferenceEngine::TabbyInferenceEngine() : impl_(new Impl) {}
+CotabbyInferenceEngine::CotabbyInferenceEngine() : impl_(new Impl) {}
 
-TabbyInferenceEngine::TabbyInferenceEngine(TabbyInferenceEngine&& other) noexcept
+CotabbyInferenceEngine::CotabbyInferenceEngine(CotabbyInferenceEngine&& other) noexcept
     : impl_(other.impl_) {
     other.impl_ = nullptr;
 }
 
-TabbyInferenceEngine::~TabbyInferenceEngine() {
+CotabbyInferenceEngine::~CotabbyInferenceEngine() {
     if (impl_) {
         unloadModel();
         delete impl_;
@@ -162,7 +162,7 @@ TabbyInferenceEngine::~TabbyInferenceEngine() {
 // Model lifecycle
 // ---------------------------------------------------------------------------
 
-EngineStatus TabbyInferenceEngine::loadModel(const char* path, int gpu_layers,
+EngineStatus CotabbyInferenceEngine::loadModel(const char* path, int gpu_layers,
                                              int context_window_tokens,
                                              int batch_size) {
     if (!impl_ || !path) return EngineStatus::error;
@@ -211,7 +211,7 @@ EngineStatus TabbyInferenceEngine::loadModel(const char* path, int gpu_layers,
     return EngineStatus::ok;
 }
 
-void TabbyInferenceEngine::unloadModel() {
+void CotabbyInferenceEngine::unloadModel() {
     if (!impl_) return;
     impl_->destroyAllSequences();
 
@@ -228,7 +228,7 @@ void TabbyInferenceEngine::unloadModel() {
     }
 }
 
-bool TabbyInferenceEngine::isModelLoaded() const {
+bool CotabbyInferenceEngine::isModelLoaded() const {
     return impl_ && impl_->model != nullptr;
 }
 
@@ -236,7 +236,7 @@ bool TabbyInferenceEngine::isModelLoaded() const {
 // Sequence lifecycle
 // ---------------------------------------------------------------------------
 
-int32_t TabbyInferenceEngine::createSequence(SamplingConfig config) {
+int32_t CotabbyInferenceEngine::createSequence(SamplingConfig config) {
     if (!impl_->model) return -1;
 
     {
@@ -277,7 +277,7 @@ int32_t TabbyInferenceEngine::createSequence(SamplingConfig config) {
     return id;
 }
 
-void TabbyInferenceEngine::destroySequence(int32_t sequence_id) {
+void CotabbyInferenceEngine::destroySequence(int32_t sequence_id) {
     std::lock_guard<std::mutex> lock(impl_->sequences_mutex);
     impl_->sequences.erase(sequence_id);
 }
@@ -286,7 +286,7 @@ void TabbyInferenceEngine::destroySequence(int32_t sequence_id) {
 // Tokenization
 // ---------------------------------------------------------------------------
 
-std::vector<int32_t> TabbyInferenceEngine::tokenize(const char* text,
+std::vector<int32_t> CotabbyInferenceEngine::tokenize(const char* text,
                                                      int text_length) const {
     if (!impl_->vocab || !text || text_length <= 0) {
         return {};
@@ -319,7 +319,7 @@ std::vector<int32_t> TabbyInferenceEngine::tokenize(const char* text,
     }
 }
 
-int TabbyInferenceEngine::detokenize(int32_t token, char* buffer,
+int CotabbyInferenceEngine::detokenize(int32_t token, char* buffer,
                                       int buffer_size) const {
     if (!impl_->vocab || !buffer || buffer_size <= 0) return 0;
 
@@ -339,7 +339,7 @@ int TabbyInferenceEngine::detokenize(int32_t token, char* buffer,
 // Prompt decoding
 // ---------------------------------------------------------------------------
 
-EngineStatus TabbyInferenceEngine::decodePrompt(int32_t sequence_id,
+EngineStatus CotabbyInferenceEngine::decodePrompt(int32_t sequence_id,
                                                  const int32_t* tokens,
                                                  int token_count,
                                                  int start_position) {
@@ -401,7 +401,7 @@ EngineStatus TabbyInferenceEngine::decodePrompt(int32_t sequence_id,
 // Sampling
 // ---------------------------------------------------------------------------
 
-SampleResult TabbyInferenceEngine::sampleNext(int32_t sequence_id) {
+SampleResult CotabbyInferenceEngine::sampleNext(int32_t sequence_id) {
     SampleResult result{};
     result.token = 0;
     result.piece = nullptr;
@@ -489,7 +489,7 @@ SampleResult TabbyInferenceEngine::sampleNext(int32_t sequence_id) {
 // KV cache management
 // ---------------------------------------------------------------------------
 
-bool TabbyInferenceEngine::trimKV(int32_t sequence_id, int keep_positions) {
+bool CotabbyInferenceEngine::trimKV(int32_t sequence_id, int keep_positions) {
     SequenceState* seq = impl_->findSequence(sequence_id);
     if (!seq) return false;
 
@@ -509,7 +509,7 @@ bool TabbyInferenceEngine::trimKV(int32_t sequence_id, int keep_positions) {
     return ok;
 }
 
-int TabbyInferenceEngine::getKVPositionCount(int32_t sequence_id) const {
+int CotabbyInferenceEngine::getKVPositionCount(int32_t sequence_id) const {
     const SequenceState* seq = impl_->findSequence(sequence_id);
     return seq ? seq->kv_position_count : 0;
 }
@@ -518,7 +518,7 @@ int TabbyInferenceEngine::getKVPositionCount(int32_t sequence_id) const {
 // Cancellation
 // ---------------------------------------------------------------------------
 
-void TabbyInferenceEngine::cancelSequence(int32_t sequence_id) {
+void CotabbyInferenceEngine::cancelSequence(int32_t sequence_id) {
     SequenceState* seq = impl_->findSequence(sequence_id);
     if (seq) {
         seq->cancelled.store(true, std::memory_order_release);
@@ -529,18 +529,18 @@ void TabbyInferenceEngine::cancelSequence(int32_t sequence_id) {
 // Diagnostics
 // ---------------------------------------------------------------------------
 
-int TabbyInferenceEngine::getContextWindowTokens() const {
+int CotabbyInferenceEngine::getContextWindowTokens() const {
     return impl_->context_window_tokens;
 }
 
-int TabbyInferenceEngine::getBatchSize() const {
+int CotabbyInferenceEngine::getBatchSize() const {
     return impl_->batch_size;
 }
 
-int TabbyInferenceEngine::getThreadCount() const {
+int CotabbyInferenceEngine::getThreadCount() const {
     return impl_->thread_count;
 }
 
-int TabbyInferenceEngine::getGPULayerCount() const {
+int CotabbyInferenceEngine::getGPULayerCount() const {
     return impl_->gpu_layer_count;
 }
