@@ -70,9 +70,9 @@ final class LlamaMiddlewareTests: XCTestCase {
     }
 
     func testEndToEndWithModel() throws {
-        let modelPath = "/Users/jacobfu/Library/Application Support/tabby/LlamaRuntime/Qwen3-0.6B-Q4_K_M.gguf"
-        guard FileManager.default.fileExists(atPath: modelPath) else {
-            throw XCTSkip("Test model not found at \(modelPath)")
+        guard let modelPath = ProcessInfo.processInfo.environment["COTABBY_TEST_MODEL_PATH"],
+              FileManager.default.fileExists(atPath: modelPath) else {
+            throw XCTSkip("Set COTABBY_TEST_MODEL_PATH to a .gguf file to run this test")
         }
 
         var engine = CotabbyInferenceEngine()
