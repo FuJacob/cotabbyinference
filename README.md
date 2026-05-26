@@ -1,6 +1,6 @@
 # CotabbyInference
 
-A C++ middleware layer for running LLM inference on-device, built on top of [llama.cpp](https://github.com/ggml-org/llama.cpp). Designed as the inference backend for [Cotabby](https://github.com/nicktrienenern/Cotabby), a macOS AI assistant.
+A C++ middleware layer for running LLM inference on-device, built on top of [llama.cpp](https://github.com/ggml-org/llama.cpp). Designed as the inference backend for [Cotabby](https://github.com/fujacob/cotabby), a macOS AI assistant.
 
 [![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
