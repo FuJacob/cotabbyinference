@@ -252,14 +252,8 @@ int32_t CotabbyInferenceEngine::createSequence(SamplingConfig config) {
     ctx_params.n_batch = static_cast<uint32_t>(impl_->batch_size);
     ctx_params.n_ubatch = static_cast<uint32_t>(impl_->batch_size);
     ctx_params.n_seq_max = 1;
-    // Per-sequence thread budget: a positive config value lets callers cap a background sequence
-    // (e.g. the summarizer) so it shares cores with autocomplete instead of oversubscribing them.
-    // Anything <= 0 falls back to the engine default of all hardware threads.
-    const int32_t sequence_threads = config.thread_count > 0
-        ? static_cast<int32_t>(config.thread_count)
-        : static_cast<int32_t>(impl_->thread_count);
-    ctx_params.n_threads = sequence_threads;
-    ctx_params.n_threads_batch = sequence_threads;
+    ctx_params.n_threads = static_cast<int32_t>(impl_->thread_count);
+    ctx_params.n_threads_batch = static_cast<int32_t>(impl_->thread_count);
     ctx_params.offload_kqv = true;
 
     llama_context* ctx = llama_init_from_model(impl_->model, ctx_params);

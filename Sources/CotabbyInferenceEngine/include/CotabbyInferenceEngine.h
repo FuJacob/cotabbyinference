@@ -11,11 +11,6 @@ struct SamplingConfig {
     float min_p;
     float repetition_penalty;
     uint32_t seed;
-    // CPU threads this sequence's context may use during decode. 0 (or negative) keeps the
-    // engine default of all hardware threads. Set a smaller budget on background sequences (e.g.
-    // the visual-context summarizer) so they decode concurrently with latency-critical
-    // autocomplete instead of oversubscribing every core and starving it.
-    int thread_count;
 };
 
 struct SWIFT_SELF_CONTAINED SampleResult {

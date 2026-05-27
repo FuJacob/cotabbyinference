@@ -31,8 +31,7 @@ final class LlamaMiddlewareTests: XCTestCase {
             top_p: 0.7,
             min_p: 0.08,
             repetition_penalty: 1.05,
-            seed: 0,
-            thread_count: 0
+            seed: 0
         )
         let seqId = engine.createSequence(config)
         XCTAssertEqual(seqId, -1)
@@ -108,8 +107,7 @@ final class LlamaMiddlewareTests: XCTestCase {
             top_p: 0.7,
             min_p: 0.08,
             repetition_penalty: 1.05,
-            seed: 42,
-            thread_count: 0
+            seed: 42
         )
         let seqA = engine.createSequence(autoConfig)
         XCTAssertGreaterThan(seqA, 0)
@@ -154,10 +152,7 @@ final class LlamaMiddlewareTests: XCTestCase {
             top_p: 0.95,
             min_p: 0.05,
             repetition_penalty: 1.4,
-            seed: 0,
-            // Background summary sequence runs on a reduced thread budget so it can decode
-            // concurrently with autocomplete instead of oversubscribing every core.
-            thread_count: 2
+            seed: 0
         )
         let seqB = engine.createSequence(summaryConfig)
         XCTAssertGreaterThan(seqB, 0)
