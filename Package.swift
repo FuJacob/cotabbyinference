@@ -33,5 +33,18 @@ let package = Package(
                 .interoperabilityMode(.Cxx),
             ]
         ),
+        // Phase 0 spike: standalone executable that compares aggregate decode
+        // tok/s between the current "separate llama_context per sequence"
+        // architecture and a prospective shared-context-with-batched-decode
+        // architecture. Used to decide whether the Phase 1 refactor is worth
+        // doing on M-series + Metal. Not linked into CotabbyInference itself.
+        .executableTarget(
+            name: "CotabbyInferenceBench",
+            dependencies: ["llama-cpp"],
+            path: "Sources/CotabbyInferenceBench",
+            cxxSettings: [
+                .unsafeFlags(["-std=c++17"]),
+            ]
+        ),
     ]
 )
