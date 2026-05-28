@@ -173,4 +173,116 @@ final class LlamaMiddlewareTests: XCTestCase {
         engine.unloadModel()
         XCTAssertFalse(engine.isModelLoaded())
     }
+
+    // Multi-sequence sequential test. Drives the new shared-context decoder
+    // thread through two interleaved sampling loops to verify the seed-token
+    // / feedback-decode handoff produces valid tokens for both sequences
+    // when their sampleNext calls alternate.
+    func testInterleavedMultiSequenceSampling() throws {
+        guard let modelPath = ProcessInfo.processInfo.environment["COTABBY_TEST_MODEL_PATH"] else {
+            try XCTSkipIf(true, "Set COTABBY_TEST_MODEL_PATH to a .gguf file to run this test")
+            return
+        }
+
+        var engine = CotabbyInferenceEngine()
+        XCTAssertEqual(engine.loadModel(modelPath, -1, 1024, 256), EngineStatus.ok)
+        defer { engine.unloadModel() }
+
+        let prompt = "The quick brown fox jumps over the lazy dog."
+        let tokens = engine.tokenize(prompt, Int32(prompt.utf8.count))
+        XCTAssertGreaterThan(tokens.size(), 0)
+
+        let configA = SamplingConfig(
+            max_prediction_tokens: 16, temperature: 0,
+            top_k: 0, top_p: 0, min_p: 0,
+            repetition_penalty: 0, seed: 1
+        )
+        let configB = SamplingConfig(
+            max_prediction_tokens: 16, temperature: 0,
+            top_k: 0, top_p: 0, min_p: 0,
+            repetition_penalty: 0, seed: 2
+        )
+
+        let seqA = engine.createSequence(configA)
+        let seqB = engine.createSequence(configB)
+        XCTAssertGreaterThan(seqA, 0)
+        XCTAssertGreaterThan(seqB, 0)
+
+        var tokenArr = Array(tokens)
+        XCTAssertEqual(
+            engine.decodePrompt(seqA, &tokenArr, Int32(tokenArr.count), 0),
+            EngineStatus.ok
+        )
+        XCTAssertEqual(
+            engine.decodePrompt(seqB, &tokenArr, Int32(tokenArr.count), 0),
+            EngineStatus.ok
+        )
+
+        // Alternate sampleNext between the two sequences. With greedy
+        // sampling and identical prompts, the first sampled tokens for both
+        // sequences should be identical (different samplers reading the
+        // same logits row at separate decodePrompt times).
+        var sampledA: [Int32] = []
+        var sampledB: [Int32] = []
+        for _ in 0..<8 {
+            let rA = engine.sampleNext(seqA)
+            let rB = engine.sampleNext(seqB)
+            XCTAssertFalse(rA.was_cancelled)
+            XCTAssertFalse(rB.was_cancelled)
+            if rA.is_eos || rB.is_eos { break }
+            sampledA.append(rA.token)
+            sampledB.append(rB.token)
+        }
+        XCTAssertEqual(sampledA.count, sampledB.count)
+        XCTAssertGreaterThan(sampledA.count, 0)
+        XCTAssertEqual(sampledA, sampledB,
+            "Greedy sampling with identical prompts should match across sequences")
+
+        engine.destroySequence(seqA)
+        engine.destroySequence(seqB)
+    }
+
+    // Cancellation regression: setting cancelled on a sequence mid-loop must
+    // cause subsequent sampleNext calls to return was_cancelled=true so
+    // callers can break out without waiting for the full prediction budget.
+    func testCancellationStopsSamplingPromptly() throws {
+        guard let modelPath = ProcessInfo.processInfo.environment["COTABBY_TEST_MODEL_PATH"] else {
+            try XCTSkipIf(true, "Set COTABBY_TEST_MODEL_PATH to a .gguf file to run this test")
+            return
+        }
+
+        var engine = CotabbyInferenceEngine()
+        XCTAssertEqual(engine.loadModel(modelPath, -1, 1024, 256), EngineStatus.ok)
+        defer { engine.unloadModel() }
+
+        let prompt = "Hello"
+        let tokens = engine.tokenize(prompt, Int32(prompt.utf8.count))
+        let config = SamplingConfig(
+            max_prediction_tokens: 32, temperature: 0,
+            top_k: 0, top_p: 0, min_p: 0,
+            repetition_penalty: 0, seed: 0
+        )
+
+        let seq = engine.createSequence(config)
+        var tokenArr = Array(tokens)
+        XCTAssertEqual(
+            engine.decodePrompt(seq, &tokenArr, Int32(tokenArr.count), 0),
+            EngineStatus.ok
+        )
+
+        // Sample a couple of tokens first.
+        for _ in 0..<2 {
+            let r = engine.sampleNext(seq)
+            XCTAssertFalse(r.was_cancelled)
+        }
+
+        // Cancel. The next sampleNext should return was_cancelled=true
+        // without doing any further model work.
+        engine.cancelSequence(seq)
+        let cancelled = engine.sampleNext(seq)
+        XCTAssertTrue(cancelled.was_cancelled,
+            "sampleNext after cancelSequence must return was_cancelled=true")
+
+        engine.destroySequence(seq)
+    }
 }
