@@ -584,55 +584,49 @@ bool CotabbyInferenceEngine::hasChatTemplate() const {
     return llama_model_chat_template(impl_->model, /*name=*/nullptr) != nullptr;
 }
 
-std::string CotabbyInferenceEngine::applyChatTemplate(
-    const ChatMessage* messages, int message_count,
-    bool add_assistant) const {
-    if (!impl_->model || !messages || message_count <= 0) {
-        return {};
+int CotabbyInferenceEngine::applyChatTemplate(
+    const char* system_text,
+    const char* user_text,
+    bool add_assistant,
+    char* buffer,
+    int buffer_size) const {
+    if (!impl_->model || !system_text || !user_text ||
+        !buffer || buffer_size <= 0) {
+        return 0;
     }
 
     const char* tmpl = llama_model_chat_template(impl_->model, /*name=*/nullptr);
     if (!tmpl) {
-        return {};
+        return 0;
     }
 
-    // `llama_chat_message` holds borrowed `const char*`. The backing
-    // std::strings live in `messages` for the duration of this call, so
-    // pointing at their c_str() is safe.
-    std::vector<llama_chat_message> chat;
-    chat.reserve(message_count);
-    size_t total_chars = 0;
-    for (int i = 0; i < message_count; ++i) {
-        chat.push_back(llama_chat_message{
-            messages[i].role.c_str(),
-            messages[i].content.c_str()
-        });
-        total_chars += messages[i].role.size() + messages[i].content.size();
-    }
+    // Borrowed `const char*` from the caller; valid for this call's duration.
+    llama_chat_message chat[2] = {
+        { "system", system_text },
+        { "user", user_text }
+    };
 
-    // The header recommends an initial buffer of 2x the total message
-    // characters; grow and retry if the template expands beyond that.
-    std::vector<char> buf(std::max<size_t>(total_chars * 2, 256));
-    while (true) {
-        int32_t n = llama_chat_apply_template(
-            tmpl,
-            chat.data(),
-            chat.size(),
-            add_assistant,
-            buf.data(),
-            static_cast<int32_t>(buf.size())
-        );
+    int32_t n = llama_chat_apply_template(
+        tmpl,
+        chat,
+        2,
+        add_assistant,
+        buffer,
+        static_cast<int32_t>(buffer_size)
+    );
 
-        if (n < 0) {
-            // Template not supported by llama.cpp's predefined list, or some
-            // other failure. Signal "fall back to the raw path".
-            return {};
-        }
-        if (static_cast<size_t>(n) <= buf.size()) {
-            return std::string(buf.data(), static_cast<size_t>(n));
-        }
-        buf.resize(static_cast<size_t>(n));
+    // Contract of llama_chat_apply_template: returns the total byte length of
+    // the formatted prompt; negative means the template is unsupported by
+    // llama.cpp's predefined list. A positive value larger than the buffer
+    // means the output did not fit and the caller must retry with a bigger
+    // buffer. Map all three onto this function's documented C-ABI contract.
+    if (n < 0) {
+        return 0;              // genuine render failure → caller falls back to raw
     }
+    if (n > buffer_size) {
+        return -n;             // too small → -(required size); caller resizes and retries
+    }
+    return n;                  // success: n bytes written (n <= buffer_size)
 }
 
 int CotabbyInferenceEngine::detokenize(int32_t token, char* buffer,

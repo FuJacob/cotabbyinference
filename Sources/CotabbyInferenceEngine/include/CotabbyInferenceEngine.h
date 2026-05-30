@@ -1,6 +1,5 @@
 #pragma once
 #include <cstdint>
-#include <string>
 #include <vector>
 #include <swift/bridging>
 
@@ -12,13 +11,6 @@ struct SamplingConfig {
     float min_p;
     float repetition_penalty;
     uint32_t seed;
-};
-
-/// One message in a chat-template conversation, mirroring `llama_chat_message`.
-/// Roles are the usual "system" / "user" / "assistant". Owned by the caller.
-struct ChatMessage {
-    std::string role;
-    std::string content;
 };
 
 struct SWIFT_SELF_CONTAINED SampleResult {
@@ -78,13 +70,24 @@ public:
     // chat-template prompt path and the legacy raw-continuation path so a
     // user-supplied base model keeps working.
     bool hasChatTemplate() const;
-    // Renders `messages` through the model's built-in chat template and returns
-    // the formatted prompt string. `add_assistant` appends the assistant-turn
-    // opening marker so the model continues as the assistant. Returns an empty
-    // string if no model is loaded, the model has no template, or formatting
-    // fails — callers must treat empty as "fall back to the raw path".
-    std::string applyChatTemplate(const ChatMessage* messages, int message_count,
-                                  bool add_assistant) const;
+    // Renders a system + user turn through the model's built-in chat template
+    // into `buffer`. `add_assistant` appends the assistant-turn opening marker
+    // so the model continues as the assistant. Returns:
+    //   > 0 : number of bytes written (<= buffer_size) — the formatted prompt.
+    //   < 0 : -(required buffer size); the buffer was too small, retry at that size.
+    //   = 0 : no model, no template, or render failure — caller falls back to raw.
+    //
+    // Autocomplete needs exactly one system turn (rules + context) and one user
+    // turn (the text to continue), so the signature takes those two directly
+    // rather than a message array. This buffer-based C ABI mirrors `detokenize`
+    // and deliberately avoids std::string / struct parameter and return types,
+    // so it bridges cleanly into the Swift objcxx interop mode the app target
+    // uses (where a std::string return does not bridge).
+    int applyChatTemplate(const char* system_text,
+                          const char* user_text,
+                          bool add_assistant,
+                          char* buffer,
+                          int buffer_size) const;
 
     // Prompt decoding
     EngineStatus decodePrompt(int32_t sequence_id,
