@@ -55,6 +55,30 @@ final class LlamaMiddlewareTests: XCTestCase {
         XCTAssertTrue(tokens.isEmpty)
     }
 
+    func testTokenizeWithOptionsWithoutModelReturnsEmpty() {
+        let engine = CotabbyInferenceEngine()
+        let text = "hello"
+        let tokens = engine.tokenizeWithOptions(
+            text, Int32(text.utf8.count), false, true
+        )
+        XCTAssertTrue(tokens.isEmpty)
+    }
+
+    func testHasChatTemplateWithoutModelIsFalse() {
+        let engine = CotabbyInferenceEngine()
+        XCTAssertFalse(engine.hasChatTemplate())
+    }
+
+    func testApplyChatTemplateWithoutModelReturnsEmpty() {
+        let engine = CotabbyInferenceEngine()
+        var messages = [ChatMessage]()
+        messages.append(ChatMessage(role: "user", content: "hi"))
+        let rendered = messages.withUnsafeBufferPointer { buf in
+            engine.applyChatTemplate(buf.baseAddress, Int32(buf.count), true)
+        }
+        XCTAssertTrue(rendered.isEmpty)
+    }
+
     func testDiagnosticsDefaultToZero() {
         let engine = CotabbyInferenceEngine()
         XCTAssertEqual(engine.getContextWindowTokens(), 0)
@@ -93,6 +117,26 @@ final class LlamaMiddlewareTests: XCTestCase {
         let prompt = "The quick brown fox"
         let tokens = engine.tokenize(prompt, Int32(prompt.utf8.count))
         XCTAssertFalse(tokens.isEmpty)
+
+        // Chat-template path: instruct models ship a template; if present,
+        // rendering a simple conversation must produce a non-empty prompt that
+        // tokenizes (with parse_special) to a non-empty token list.
+        if engine.hasChatTemplate() {
+            var messages = [ChatMessage]()
+            messages.append(ChatMessage(role: "system", content: "You complete text."))
+            messages.append(ChatMessage(role: "user", content: "The quick brown"))
+            let rendered = messages.withUnsafeBufferPointer { buf in
+                engine.applyChatTemplate(buf.baseAddress, Int32(buf.count), true)
+            }
+            // applyChatTemplate returns a C++ std::string; bridge to a Swift
+            // String before using String APIs like .utf8.
+            let renderedSwift = String(rendered)
+            XCTAssertFalse(renderedSwift.isEmpty, "Model reports a template but rendering was empty")
+            let templated = engine.tokenizeWithOptions(
+                renderedSwift, Int32(renderedSwift.utf8.count), false, true
+            )
+            XCTAssertFalse(templated.isEmpty)
+        }
 
         // Detokenize first token
         var buf = [CChar](repeating: 0, count: 64)

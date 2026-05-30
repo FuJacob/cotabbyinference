@@ -539,11 +539,19 @@ void CotabbyInferenceEngine::destroySequence(int32_t sequence_id) {
 
 std::vector<int32_t> CotabbyInferenceEngine::tokenize(const char* text,
                                                      int text_length) const {
+    // Preserve the historical contract: add BOS per model metadata, treat any
+    // special-token text as plaintext (parse_special = false).
+    bool add_bos = impl_->vocab ? llama_vocab_get_add_bos(impl_->vocab) : false;
+    return tokenizeWithOptions(text, text_length, add_bos, false);
+}
+
+std::vector<int32_t> CotabbyInferenceEngine::tokenizeWithOptions(
+    const char* text, int text_length,
+    bool add_special, bool parse_special) const {
     if (!impl_->vocab || !text || text_length <= 0) {
         return {};
     }
 
-    bool add_bos = llama_vocab_get_add_bos(impl_->vocab);
     int capacity = text_length + 8;
 
     while (true) {
@@ -554,8 +562,8 @@ std::vector<int32_t> CotabbyInferenceEngine::tokenize(const char* text,
             static_cast<int32_t>(text_length),
             tokens.data(),
             static_cast<int32_t>(capacity),
-            add_bos,
-            false
+            add_special,
+            parse_special
         );
 
         if (n > 0) {
@@ -566,6 +574,64 @@ std::vector<int32_t> CotabbyInferenceEngine::tokenize(const char* text,
             return {};
         }
         capacity = std::max(capacity * 2, -n);
+    }
+}
+
+bool CotabbyInferenceEngine::hasChatTemplate() const {
+    if (!impl_->model) {
+        return false;
+    }
+    return llama_model_chat_template(impl_->model, /*name=*/nullptr) != nullptr;
+}
+
+std::string CotabbyInferenceEngine::applyChatTemplate(
+    const ChatMessage* messages, int message_count,
+    bool add_assistant) const {
+    if (!impl_->model || !messages || message_count <= 0) {
+        return {};
+    }
+
+    const char* tmpl = llama_model_chat_template(impl_->model, /*name=*/nullptr);
+    if (!tmpl) {
+        return {};
+    }
+
+    // `llama_chat_message` holds borrowed `const char*`. The backing
+    // std::strings live in `messages` for the duration of this call, so
+    // pointing at their c_str() is safe.
+    std::vector<llama_chat_message> chat;
+    chat.reserve(message_count);
+    size_t total_chars = 0;
+    for (int i = 0; i < message_count; ++i) {
+        chat.push_back(llama_chat_message{
+            messages[i].role.c_str(),
+            messages[i].content.c_str()
+        });
+        total_chars += messages[i].role.size() + messages[i].content.size();
+    }
+
+    // The header recommends an initial buffer of 2x the total message
+    // characters; grow and retry if the template expands beyond that.
+    std::vector<char> buf(std::max<size_t>(total_chars * 2, 256));
+    while (true) {
+        int32_t n = llama_chat_apply_template(
+            tmpl,
+            chat.data(),
+            chat.size(),
+            add_assistant,
+            buf.data(),
+            static_cast<int32_t>(buf.size())
+        );
+
+        if (n < 0) {
+            // Template not supported by llama.cpp's predefined list, or some
+            // other failure. Signal "fall back to the raw path".
+            return {};
+        }
+        if (static_cast<size_t>(n) <= buf.size()) {
+            return std::string(buf.data(), static_cast<size_t>(n));
+        }
+        buf.resize(static_cast<size_t>(n));
     }
 }
 
