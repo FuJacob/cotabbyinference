@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <string>
 #include <vector>
 #include <swift/bridging>
 
@@ -11,6 +12,13 @@ struct SamplingConfig {
     float min_p;
     float repetition_penalty;
     uint32_t seed;
+};
+
+/// One message in a chat-template conversation, mirroring `llama_chat_message`.
+/// Roles are the usual "system" / "user" / "assistant". Owned by the caller.
+struct ChatMessage {
+    std::string role;
+    std::string content;
 };
 
 struct SWIFT_SELF_CONTAINED SampleResult {
@@ -51,7 +59,32 @@ public:
 
     // Tokenization (thread-safe, read-only on vocab)
     std::vector<int32_t> tokenize(const char* text, int text_length) const;
+    // Like `tokenize`, but the caller controls BOS/EOS injection and whether
+    // special/control tokens in the text (e.g. chat-template markers like
+    // <|im_start|>) are recognized as their token IDs instead of plain text.
+    // The plain `tokenize` keeps `parse_special = false` for backward
+    // compatibility; the chat-template path needs `true` so rendered markers
+    // tokenize correctly.
+    std::vector<int32_t> tokenizeWithOptions(const char* text, int text_length,
+                                             bool add_special,
+                                             bool parse_special) const;
     int detokenize(int32_t token, char* buffer, int buffer_size) const;
+
+    // Chat templates
+    //
+    // `hasChatTemplate` reports whether the loaded model ships a chat template
+    // in its GGUF metadata. Instruct models (Qwen, Gemma, Llama) do; raw base
+    // models do not. Callers use this to decide between the structured
+    // chat-template prompt path and the legacy raw-continuation path so a
+    // user-supplied base model keeps working.
+    bool hasChatTemplate() const;
+    // Renders `messages` through the model's built-in chat template and returns
+    // the formatted prompt string. `add_assistant` appends the assistant-turn
+    // opening marker so the model continues as the assistant. Returns an empty
+    // string if no model is loaded, the model has no template, or formatting
+    // fails — callers must treat empty as "fall back to the raw path".
+    std::string applyChatTemplate(const ChatMessage* messages, int message_count,
+                                  bool add_assistant) const;
 
     // Prompt decoding
     EngineStatus decodePrompt(int32_t sequence_id,
