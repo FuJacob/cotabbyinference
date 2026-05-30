@@ -69,14 +69,14 @@ final class LlamaMiddlewareTests: XCTestCase {
         XCTAssertFalse(engine.hasChatTemplate())
     }
 
-    func testApplyChatTemplateWithoutModelReturnsEmpty() {
+    func testApplyChatTemplateWithoutModelReturnsZero() {
         let engine = CotabbyInferenceEngine()
-        var messages = [ChatMessage]()
-        messages.append(ChatMessage(role: "user", content: "hi"))
-        let rendered = messages.withUnsafeBufferPointer { buf in
-            engine.applyChatTemplate(buf.baseAddress, Int32(buf.count), true)
-        }
-        XCTAssertTrue(rendered.isEmpty)
+        var buffer = [CChar](repeating: 0, count: 256)
+        let written = engine.applyChatTemplate(
+            "You complete text.", "The quick brown", true, &buffer, Int32(buffer.count)
+        )
+        // No model loaded → 0 (caller falls back to the raw path).
+        XCTAssertEqual(written, 0)
     }
 
     func testDiagnosticsDefaultToZero() {
@@ -122,16 +122,22 @@ final class LlamaMiddlewareTests: XCTestCase {
         // rendering a simple conversation must produce a non-empty prompt that
         // tokenizes (with parse_special) to a non-empty token list.
         if engine.hasChatTemplate() {
-            var messages = [ChatMessage]()
-            messages.append(ChatMessage(role: "system", content: "You complete text."))
-            messages.append(ChatMessage(role: "user", content: "The quick brown"))
-            let rendered = messages.withUnsafeBufferPointer { buf in
-                engine.applyChatTemplate(buf.baseAddress, Int32(buf.count), true)
+            // Render system + user through the model's template into a caller buffer.
+            var buffer = [CChar](repeating: 0, count: 4096)
+            let written = engine.applyChatTemplate(
+                "You complete text.", "The quick brown", true, &buffer, Int32(buffer.count)
+            )
+            XCTAssertGreaterThan(written, 0, "Model reports a template but rendering produced no bytes")
+
+            let rendered = buffer.prefix(Int(written)).withUnsafeBufferPointer { ptr in
+                String(
+                    bytes: UnsafeRawBufferPointer(ptr),
+                    encoding: .utf8
+                )
             }
-            // applyChatTemplate returns a C++ std::string; bridge to a Swift
-            // String before using String APIs like .utf8.
-            let renderedSwift = String(rendered)
-            XCTAssertFalse(renderedSwift.isEmpty, "Model reports a template but rendering was empty")
+            let renderedSwift = try XCTUnwrap(rendered, "Rendered template was not valid UTF-8")
+            XCTAssertFalse(renderedSwift.isEmpty)
+
             let templated = engine.tokenizeWithOptions(
                 renderedSwift, Int32(renderedSwift.utf8.count), false, true
             )
