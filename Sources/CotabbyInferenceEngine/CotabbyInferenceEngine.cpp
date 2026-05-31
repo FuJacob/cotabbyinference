@@ -55,6 +55,9 @@ struct SequenceState {
     // Set by setForceWordContinuation; consumed (and cleared) when the next seed token is sampled.
     bool force_word_continuation = false;
 
+    // Log-probability of the seed token, computed at decodePrompt and returned with the seed.
+    float seed_logprob = 0.0f;
+
     ~SequenceState() {
         if (sampler) { llama_sampler_free(sampler); }
     }
@@ -71,7 +74,8 @@ struct SequenceState {
           has_seed_token(o.has_seed_token),
           pending_input_token(o.pending_input_token),
           has_pending_input(o.has_pending_input),
-          force_word_continuation(o.force_word_continuation) {
+          force_word_continuation(o.force_word_continuation),
+          seed_logprob(o.seed_logprob) {
         o.sampler = nullptr;
     }
     SequenceState& operator=(SequenceState&&) = delete;
@@ -300,6 +304,28 @@ struct CotabbyInferenceEngine::Impl {
         }
     }
 
+    // Log-probability of `token` under the raw model distribution at `logits_row`, used as a
+    // confidence signal. Two O(vocab) passes; only invoked on the autocomplete path.
+    float computeLogprob(int logits_row, llama_token token) const {
+        if (!shared_ctx || !vocab) return 0.0f;
+        const float* logits = llama_get_logits_ith(shared_ctx, logits_row);
+        if (!logits) return 0.0f;
+        const int32_t n = llama_vocab_n_tokens(vocab);
+        if (token < 0 || token >= n) return 0.0f;
+        float maxLogit = -INFINITY;
+        for (llama_token t = 0; t < n; ++t) {
+            if (logits[t] > maxLogit) { maxLogit = logits[t]; }
+        }
+        double sumExp = 0.0;
+        for (llama_token t = 0; t < n; ++t) {
+            sumExp += std::exp(static_cast<double>(logits[t] - maxLogit));
+        }
+        if (!(sumExp > 0.0)) return 0.0f;
+        return static_cast<float>(
+            static_cast<double>(logits[token] - maxLogit) - std::log(sumExp)
+        );
+    }
+
     void destroyAllSequences() {
         std::lock_guard<std::mutex> lock(sequences_mutex);
         for (auto& [id, seq] : sequences) {
@@ -428,6 +454,7 @@ struct CotabbyInferenceEngine::Impl {
                     r.token = next;
                     r.piece = piece.c_str();
                     r.piece_length = static_cast<int>(piece.size());
+                    r.logprob = computeLogprob(i, next);
                 }
             }
 
@@ -823,6 +850,7 @@ EngineStatus CotabbyInferenceEngine::decodePrompt(int32_t sequence_id,
     llama_token seed = llama_sampler_sample(seq->sampler, impl_->shared_ctx, -1);
     llama_sampler_accept(seq->sampler, seed);
     seq->seed_token = seed;
+    seq->seed_logprob = impl_->computeLogprob(-1, seed);
     seq->has_seed_token = true;
     seq->has_pending_input = false;
 
@@ -893,6 +921,7 @@ SampleResult CotabbyInferenceEngine::sampleNext(int32_t sequence_id) {
         result.token = next;
         result.piece = seq->last_piece.c_str();
         result.piece_length = static_cast<int>(seq->last_piece.size());
+        result.logprob = seq->seed_logprob;
         return result;
     }
 

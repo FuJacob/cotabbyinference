@@ -440,4 +440,34 @@ final class LlamaMiddlewareTests: XCTestCase {
 
         engine.destroySequence(seq)
     }
+
+    // A sampled (non-EOS) token must carry a finite log-probability that is <= 0, so the app can use
+    // it as a confidence signal.
+    func testSampleNextReportsFiniteLogprob() throws {
+        guard let modelPath = ProcessInfo.processInfo.environment["COTABBY_TEST_MODEL_PATH"] else {
+            try XCTSkipIf(true, "Set COTABBY_TEST_MODEL_PATH to a .gguf file to run this test")
+            return
+        }
+        var engine = CotabbyInferenceEngine()
+        XCTAssertEqual(engine.loadModel(modelPath, -1, 1024, 256), EngineStatus.ok)
+        defer { engine.unloadModel() }
+
+        let config = SamplingConfig(
+            max_prediction_tokens: 4, temperature: 0,
+            top_k: 0, top_p: 0, min_p: 0,
+            repetition_penalty: 0, seed: 0,
+            single_line: false
+        )
+        let seq = engine.createSequence(config)
+        let prompt = "The quick brown fox"
+        var tokens = Array(engine.tokenize(prompt, Int32(prompt.utf8.count)))
+        XCTAssertEqual(engine.decodePrompt(seq, &tokens, Int32(tokens.count), 0), EngineStatus.ok)
+
+        let result = engine.sampleNext(seq)
+        if !result.is_eos {
+            XCTAssertTrue(result.logprob.isFinite, "logprob must be finite")
+            XCTAssertLessThanOrEqual(result.logprob, 0.0001, "a log-probability must be <= 0")
+        }
+        engine.destroySequence(seq)
+    }
 }

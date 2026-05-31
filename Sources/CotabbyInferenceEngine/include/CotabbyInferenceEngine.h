@@ -24,6 +24,9 @@ struct SWIFT_SELF_CONTAINED SampleResult {
     int piece_length;
     bool is_eos;
     bool was_cancelled;
+    // Log-probability of the chosen token under the raw model distribution (<= 0). Used as a
+    // confidence signal; 0 for the EOS/cancelled cases where it carries no meaning.
+    float logprob;
 };
 
 enum class EngineStatus : int {
