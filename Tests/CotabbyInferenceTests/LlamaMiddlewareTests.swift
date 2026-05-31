@@ -31,7 +31,8 @@ final class LlamaMiddlewareTests: XCTestCase {
             top_p: 0.7,
             min_p: 0.08,
             repetition_penalty: 1.05,
-            seed: 0
+            seed: 0,
+            single_line: false
         )
         let seqId = engine.createSequence(config)
         XCTAssertEqual(seqId, -1)
@@ -144,9 +145,10 @@ final class LlamaMiddlewareTests: XCTestCase {
             XCTAssertFalse(templated.isEmpty)
         }
 
-        // Detokenize first token
+        // Detokenize a content token (the prompt's last token). Index 0 can be BOS, a control
+        // token that renders to zero bytes with special=false, so we avoid it here.
         var buf = [CChar](repeating: 0, count: 64)
-        let written = engine.detokenize(tokens[0], &buf, Int32(buf.count))
+        let written = engine.detokenize(tokens[tokens.count - 1], &buf, Int32(buf.count))
         XCTAssertGreaterThan(written, 0)
 
         // Create autocomplete sequence
@@ -157,7 +159,8 @@ final class LlamaMiddlewareTests: XCTestCase {
             top_p: 0.7,
             min_p: 0.08,
             repetition_penalty: 1.05,
-            seed: 42
+            seed: 42,
+            single_line: false
         )
         let seqA = engine.createSequence(autoConfig)
         XCTAssertGreaterThan(seqA, 0)
@@ -202,7 +205,8 @@ final class LlamaMiddlewareTests: XCTestCase {
             top_p: 0.95,
             min_p: 0.05,
             repetition_penalty: 1.4,
-            seed: 0
+            seed: 0,
+            single_line: false
         )
         let seqB = engine.createSequence(summaryConfig)
         XCTAssertGreaterThan(seqB, 0)
@@ -245,12 +249,14 @@ final class LlamaMiddlewareTests: XCTestCase {
         let configA = SamplingConfig(
             max_prediction_tokens: 16, temperature: 0,
             top_k: 0, top_p: 0, min_p: 0,
-            repetition_penalty: 0, seed: 1
+            repetition_penalty: 0, seed: 1,
+            single_line: false
         )
         let configB = SamplingConfig(
             max_prediction_tokens: 16, temperature: 0,
             top_k: 0, top_p: 0, min_p: 0,
-            repetition_penalty: 0, seed: 2
+            repetition_penalty: 0, seed: 2,
+            single_line: false
         )
 
         let seqA = engine.createSequence(configA)
@@ -310,7 +316,8 @@ final class LlamaMiddlewareTests: XCTestCase {
         let config = SamplingConfig(
             max_prediction_tokens: 32, temperature: 0,
             top_k: 0, top_p: 0, min_p: 0,
-            repetition_penalty: 0, seed: 0
+            repetition_penalty: 0, seed: 0,
+            single_line: false
         )
 
         let seq = engine.createSequence(config)
@@ -332,6 +339,104 @@ final class LlamaMiddlewareTests: XCTestCase {
         let cancelled = engine.sampleNext(seq)
         XCTAssertTrue(cancelled.was_cancelled,
             "sampleNext after cancelSequence must return was_cancelled=true")
+
+        engine.destroySequence(seq)
+    }
+
+    func testSetForceWordContinuationWithoutModelDoesNotCrash() {
+        var engine = CotabbyInferenceEngine()
+        engine.setForceWordContinuation(999, true)
+        engine.setForceWordContinuation(-1, false)
+        XCTAssertFalse(engine.isModelLoaded())
+    }
+
+    func testSnapshotSizeWithoutModelIsZero() {
+        let engine = CotabbyInferenceEngine()
+        XCTAssertEqual(engine.snapshotSize(1), 0)
+    }
+
+    // With the first-token word-continuation constraint set, the seed token must not start a new
+    // word, i.e. its decoded text must not begin with whitespace.
+    func testForceWordContinuationConstrainsFirstToken() throws {
+        guard let modelPath = ProcessInfo.processInfo.environment["COTABBY_TEST_MODEL_PATH"] else {
+            try XCTSkipIf(true, "Set COTABBY_TEST_MODEL_PATH to a .gguf file to run this test")
+            return
+        }
+        var engine = CotabbyInferenceEngine()
+        XCTAssertEqual(engine.loadModel(modelPath, -1, 1024, 256), EngineStatus.ok)
+        defer { engine.unloadModel() }
+
+        let config = SamplingConfig(
+            max_prediction_tokens: 8, temperature: 0,
+            top_k: 0, top_p: 0, min_p: 0,
+            repetition_penalty: 0, seed: 0,
+            single_line: false
+        )
+        let seq = engine.createSequence(config)
+        XCTAssertGreaterThan(seq, 0)
+
+        // Prompt ends mid-word ("writ"); the forced continuation must finish the word.
+        let prompt = "I am writ"
+        var tokens = Array(engine.tokenize(prompt, Int32(prompt.utf8.count)))
+        XCTAssertGreaterThan(tokens.count, 0)
+
+        engine.setForceWordContinuation(seq, true)
+        XCTAssertEqual(engine.decodePrompt(seq, &tokens, Int32(tokens.count), 0), EngineStatus.ok)
+
+        let result = engine.sampleNext(seq)
+        if !result.is_eos, let piece = result.piece, result.piece_length > 0 {
+            let text = String(
+                bytes: UnsafeBufferPointer(
+                    start: UnsafeRawPointer(piece).assumingMemoryBound(to: UInt8.self),
+                    count: Int(result.piece_length)
+                ),
+                encoding: .utf8
+            ) ?? ""
+            if let firstChar = text.first {
+                XCTAssertFalse(
+                    firstChar.isWhitespace,
+                    "Forced word continuation must not begin the first token with whitespace"
+                )
+            }
+        }
+        engine.destroySequence(seq)
+    }
+
+    // Snapshotting a sequence then restoring it must return the engine's KV position bookkeeping
+    // to the captured value.
+    func testSnapshotRestorePreservesPosition() throws {
+        guard let modelPath = ProcessInfo.processInfo.environment["COTABBY_TEST_MODEL_PATH"] else {
+            try XCTSkipIf(true, "Set COTABBY_TEST_MODEL_PATH to a .gguf file to run this test")
+            return
+        }
+        var engine = CotabbyInferenceEngine()
+        XCTAssertEqual(engine.loadModel(modelPath, -1, 1024, 256), EngineStatus.ok)
+        defer { engine.unloadModel() }
+
+        let config = SamplingConfig(
+            max_prediction_tokens: 8, temperature: 0,
+            top_k: 0, top_p: 0, min_p: 0,
+            repetition_penalty: 0, seed: 0,
+            single_line: false
+        )
+        let seq = engine.createSequence(config)
+        let prompt = "The quick brown fox"
+        var tokens = Array(engine.tokenize(prompt, Int32(prompt.utf8.count)))
+        XCTAssertEqual(engine.decodePrompt(seq, &tokens, Int32(tokens.count), 0), EngineStatus.ok)
+
+        let position = engine.getKVPositionCount(seq)
+        XCTAssertGreaterThan(position, 0)
+
+        let size = engine.snapshotSize(seq)
+        XCTAssertGreaterThan(size, 0)
+        var buffer = [UInt8](repeating: 0, count: Int(size))
+        let written = engine.snapshotSequence(seq, &buffer, size)
+        XCTAssertGreaterThan(written, 0)
+
+        // Advance past the snapshot point, then restore back to it.
+        _ = engine.sampleNext(seq)
+        XCTAssertTrue(engine.restoreSequence(seq, buffer, written, position))
+        XCTAssertEqual(engine.getKVPositionCount(seq), position)
 
         engine.destroySequence(seq)
     }

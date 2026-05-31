@@ -1,4 +1,5 @@
 #pragma once
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 #include <swift/bridging>
@@ -11,6 +12,10 @@ struct SamplingConfig {
     float min_p;
     float repetition_penalty;
     uint32_t seed;
+
+    // When true, tokens that introduce a line break are masked from sampling so single-line
+    // fields never receive a multi-line completion. Defaults to false to preserve prior behavior.
+    bool single_line = false;
 };
 
 struct SWIFT_SELF_CONTAINED SampleResult {
@@ -100,6 +105,20 @@ public:
     // KV cache management
     bool trimKV(int32_t sequence_id, int keep_positions);
     int getKVPositionCount(int32_t sequence_id) const;
+
+    // Constrains the FIRST token of the next generation on `sequence_id` to continue the current
+    // word: tokens whose decoded text begins with whitespace are masked for that one token, then
+    // the constraint clears. Set this before `decodePrompt`, which samples the first (seed) token.
+    void setForceWordContinuation(int32_t sequence_id, bool enabled);
+
+    // Single-sequence KV state snapshot/restore. `snapshotSize` reports the buffer size needed,
+    // `snapshotSequence` copies the sequence's KV state into `dst` (returns bytes written, 0 on
+    // failure), and `restoreSequence` loads a previously captured blob back and sets the KV
+    // position to `position_count` (returns false on failure). Blobs are model- and context-
+    // specific; never restore one across a model reload.
+    size_t snapshotSize(int32_t sequence_id) const;
+    size_t snapshotSequence(int32_t sequence_id, uint8_t* dst, size_t capacity);
+    bool restoreSequence(int32_t sequence_id, const uint8_t* src, size_t size, int position_count);
 
     // Cancellation (thread-safe, non-blocking)
     void cancelSequence(int32_t sequence_id);
