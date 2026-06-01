@@ -105,6 +105,36 @@ public:
     // Sampling
     SampleResult sampleNext(int32_t sequence_id);
 
+    // Constrained generation primitives
+    //
+    // These decouple token *selection* from the engine: a Swift caller can read the
+    // raw next-token logits, classify candidate tokens, pick one under its own
+    // constraints (grammar, vocabulary subset, etc.), and then commit it via
+    // `acceptToken` to advance the sequence. This is the manual alternative to
+    // `sampleNext`, which both selects and commits in one step.
+
+    // Total vocabulary size, i.e. the number of float logits a row from
+    // `getNextTokenLogits` contains. 0 when no model is loaded.
+    int getVocabSize() const;
+    // Whether `token` is an end-of-generation marker (EOS or any other model
+    // stop token). Callers use this to terminate manual generation loops.
+    bool isEndOfGenerationToken(int32_t token) const;
+    // The model's end-of-sequence token id, or -1 when no model is loaded.
+    int32_t endOfSequenceToken() const;
+    // Copies the next-token logits row for `sequence_id` (the distribution
+    // produced by the most recent decode) into `out`. `out_capacity` must be at
+    // least `getVocabSize()`; exactly that many floats are written. Returns the
+    // number of floats written, or 0 on any error (null buffer, unknown
+    // sequence, too-small capacity, or no live logits).
+    int getNextTokenLogits(int32_t sequence_id, float* out, int out_capacity) const;
+    // Commits `token` as the chosen next token for `sequence_id`: feeds it to the
+    // sequence's sampler (so penalty/repetition state stays consistent) and
+    // feedback-decodes it to advance the KV cache by one position, leaving fresh
+    // logits at the new position for the next `getNextTokenLogits` call. This is
+    // the commit half of the manual select-then-commit loop. Guards not_loaded /
+    // cancelled and returns `error` if the decode fails.
+    EngineStatus acceptToken(int32_t sequence_id, int32_t token);
+
     // KV cache management
     bool trimKV(int32_t sequence_id, int keep_positions);
     int getKVPositionCount(int32_t sequence_id) const;
