@@ -470,4 +470,43 @@ final class LlamaMiddlewareTests: XCTestCase {
         }
         engine.destroySequence(seq)
     }
+
+    func testSetComputeLogprobWithInvalidIdDoesNotCrash() {
+        var engine = CotabbyInferenceEngine()
+        engine.setComputeLogprob(999, false)
+        engine.setComputeLogprob(-1, true)
+    }
+
+    // Opting out of log-probabilities must zero `logprob` on both the seed token (first sampleNext)
+    // and the steady-state decoder path, while leaving the sampled tokens themselves untouched.
+    func testSetComputeLogprobFalseZeroesLogprob() throws {
+        guard let modelPath = ProcessInfo.processInfo.environment["COTABBY_TEST_MODEL_PATH"] else {
+            try XCTSkipIf(true, "Set COTABBY_TEST_MODEL_PATH to a .gguf file to run this test")
+            return
+        }
+        var engine = CotabbyInferenceEngine()
+        XCTAssertEqual(engine.loadModel(modelPath, -1, 1024, 256), EngineStatus.ok)
+        defer { engine.unloadModel() }
+
+        let config = SamplingConfig(
+            max_prediction_tokens: 4, temperature: 0,
+            top_k: 0, top_p: 0, min_p: 0,
+            repetition_penalty: 0, seed: 0,
+            single_line: false
+        )
+        let seq = engine.createSequence(config)
+        engine.setComputeLogprob(seq, false)
+
+        let prompt = "The quick brown fox"
+        var tokens = Array(engine.tokenize(prompt, Int32(prompt.utf8.count)))
+        XCTAssertEqual(engine.decodePrompt(seq, &tokens, Int32(tokens.count), 0), EngineStatus.ok)
+
+        // Seed token (computed at decodePrompt) and two steady-state tokens.
+        for _ in 0..<3 {
+            let result = engine.sampleNext(seq)
+            if result.is_eos || result.was_cancelled { break }
+            XCTAssertEqual(result.logprob, 0.0, "logprob must be exactly 0 when computation is disabled")
+        }
+        engine.destroySequence(seq)
+    }
 }

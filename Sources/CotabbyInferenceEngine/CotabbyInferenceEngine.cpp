@@ -17,7 +17,40 @@
 #include <llama/llama.h>
 #include <llama/ggml.h>
 
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#endif
+
 static void silenced_log_callback(ggml_log_level, const char*, void*) {}
+
+// Decode threads should match the *performance* core count, not the logical core count.
+// llama.cpp's CPU work is a per-layer parallel matmul with a barrier at each layer: schedule any
+// of those threads onto efficiency cores and every P-core finishes early only to stall at the
+// barrier waiting for the E-core stragglers — slower AND higher energy. With full Metal offload
+// the CPU threads only orchestrate/sample, so oversubscribing all logical cores is pure wasted
+// wake-ups. P-cores-only is the standard llama.cpp guidance on Apple Silicon; on Intel the
+// analogous rule is physical cores, not hyperthreads.
+static int resolveDecodeThreadCount() {
+#if defined(__APPLE__)
+    const auto readSysctlInt = [](const char* name) -> int {
+        int value = 0;
+        size_t size = sizeof(value);
+        if (sysctlbyname(name, &value, &size, nullptr, 0) == 0 && value > 0) {
+            return value;
+        }
+        return 0;
+    };
+    // perflevel0 = performance cores on Apple Silicon; absent on Intel, where the
+    // physical-core fallback applies.
+    if (int performance_cores = readSysctlInt("hw.perflevel0.physicalcpu")) {
+        return performance_cores;
+    }
+    if (int physical_cores = readSysctlInt("hw.physicalcpu")) {
+        return physical_cores;
+    }
+#endif
+    return static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
+}
 
 // ---------------------------------------------------------------------------
 // Per-sequence state
@@ -55,6 +88,11 @@ struct SequenceState {
     // Set by setForceWordContinuation; consumed (and cleared) when the next seed token is sampled.
     bool force_word_continuation = false;
 
+    // Whether computeLogprob runs for this sequence's tokens. Defaults to true (the historical
+    // behavior) so existing callers keep getting real log-probabilities; callers whose confidence
+    // gate is disabled opt out via setComputeLogprob to skip two O(vocab) passes per token.
+    bool compute_logprob = true;
+
     // Log-probability of the seed token, computed at decodePrompt and returned with the seed.
     float seed_logprob = 0.0f;
 
@@ -75,6 +113,7 @@ struct SequenceState {
           pending_input_token(o.pending_input_token),
           has_pending_input(o.has_pending_input),
           force_word_continuation(o.force_word_continuation),
+          compute_logprob(o.compute_logprob),
           seed_logprob(o.seed_logprob) {
         o.sampler = nullptr;
     }
@@ -100,6 +139,9 @@ struct PendingRequest {
     std::atomic<bool>* cancelled_ptr = nullptr;
     std::string* piece_buffer = nullptr;
     SampleResult* result_out = nullptr;
+    // Snapshot of the sequence's compute_logprob flag at staging time, so the decoder thread
+    // never has to re-resolve the sequence entry.
+    bool compute_logprob = true;
     std::promise<void> done;
 };
 
@@ -108,7 +150,13 @@ struct PendingRequest {
 // ---------------------------------------------------------------------------
 
 struct CotabbyInferenceEngine::Impl {
-    static constexpr int MAX_SEQUENCES = 4;
+    // Concurrent sequence slots. The shared context's KV allocation scales linearly with this
+    // (n_ctx = context_window_tokens * MAX_SEQUENCES), so every unused slot is resident RAM —
+    // hundreds of MB at a 2048-token window on multi-GB models. The app holds at most ONE live
+    // sequence (it destroys the old autocomplete sequence before building a fresh one); 2 keeps
+    // one spare slot for a concurrent secondary consumer (e.g. an eval or test driving two
+    // sequences side by side) without paying for two more that nothing has ever used.
+    static constexpr int MAX_SEQUENCES = 2;
 
     // Microseconds the decoder thread waits after the first request arrives
     // before flushing. This is the knob that lets multi-sequence callers pile
@@ -454,7 +502,9 @@ struct CotabbyInferenceEngine::Impl {
                     r.token = next;
                     r.piece = piece.c_str();
                     r.piece_length = static_cast<int>(piece.size());
-                    r.logprob = computeLogprob(i, next);
+                    // Two O(vocab) passes per token — skip entirely when the caller's confidence
+                    // gate is off and the value would be discarded.
+                    r.logprob = req.compute_logprob ? computeLogprob(i, next) : 0.0f;
                 }
             }
 
@@ -528,9 +578,10 @@ EngineStatus CotabbyInferenceEngine::loadModel(const char* path, int gpu_layers,
     impl_->context_window_tokens = context_window_tokens;
     impl_->batch_size = batch_size;
     impl_->gpu_layer_count = gpu_layers;
-    impl_->thread_count = static_cast<int>(
-        std::max(1u, std::thread::hardware_concurrency())
-    );
+    // Performance cores only — see resolveDecodeThreadCount. hardware_concurrency() counted
+    // every logical core including efficiency cores, which both slows barriered matmuls and
+    // burns extra package power for nothing when layers are Metal-offloaded anyway.
+    impl_->thread_count = resolveDecodeThreadCount();
 
     // Shared context sized to hold MAX_SEQUENCES sequences each with up to
     // `context_window_tokens` KV slots. llama.cpp's `n_ctx` is the total slot
@@ -850,7 +901,7 @@ EngineStatus CotabbyInferenceEngine::decodePrompt(int32_t sequence_id,
     llama_token seed = llama_sampler_sample(seq->sampler, impl_->shared_ctx, -1);
     llama_sampler_accept(seq->sampler, seed);
     seq->seed_token = seed;
-    seq->seed_logprob = impl_->computeLogprob(-1, seed);
+    seq->seed_logprob = seq->compute_logprob ? impl_->computeLogprob(-1, seed) : 0.0f;
     seq->has_seed_token = true;
     seq->has_pending_input = false;
 
@@ -944,6 +995,7 @@ SampleResult CotabbyInferenceEngine::sampleNext(int32_t sequence_id) {
     req.cancelled_ptr = &seq->cancelled;
     req.piece_buffer = &seq->last_piece;
     req.result_out = &result;
+    req.compute_logprob = seq->compute_logprob;
     auto done_future = req.done.get_future();
 
     {
@@ -1098,6 +1150,14 @@ void CotabbyInferenceEngine::setForceWordContinuation(int32_t sequence_id, bool 
     SequenceState* seq = impl_->findSequence(sequence_id);
     if (seq) {
         seq->force_word_continuation = enabled;
+    }
+}
+
+void CotabbyInferenceEngine::setComputeLogprob(int32_t sequence_id, bool enabled) {
+    if (!impl_) return;
+    SequenceState* seq = impl_->findSequence(sequence_id);
+    if (seq) {
+        seq->compute_logprob = enabled;
     }
 }
 

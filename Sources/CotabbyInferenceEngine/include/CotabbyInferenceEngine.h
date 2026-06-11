@@ -144,6 +144,13 @@ public:
     // the constraint clears. Set this before `decodePrompt`, which samples the first (seed) token.
     void setForceWordContinuation(int32_t sequence_id, bool enabled);
 
+    // Controls whether `SampleResult.logprob` is computed for this sequence. Defaults to true
+    // (the historical behavior). The log-probability costs two O(vocab-size) passes per generated
+    // token, so callers whose confidence gating is disabled should pass false to skip it; results
+    // then report `logprob == 0`. A method rather than a `SamplingConfig` field so existing
+    // memberwise `SamplingConfig` initializers in Swift keep compiling unchanged.
+    void setComputeLogprob(int32_t sequence_id, bool enabled);
+
     // Single-sequence KV state snapshot/restore. `snapshotSize` reports the buffer size needed,
     // `snapshotSequence` copies the sequence's KV state into `dst` (returns bytes written, 0 on
     // failure), and `restoreSequence` loads a previously captured blob back and sets the KV
