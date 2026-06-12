@@ -27,6 +27,12 @@ struct SWIFT_SELF_CONTAINED SampleResult {
     // Log-probability of the chosen token under the raw model distribution (<= 0). Used as a
     // confidence signal; 0 for the EOS/cancelled cases where it carries no meaning.
     float logprob;
+    // True when the single most-likely token of the raw distribution this token was sampled
+    // from is an end-of-generation token. Stochastic sampling can draw past the point where
+    // the model wants to stop; this flag lets callers detect that stop intent on the very
+    // step it appears, even when the sampled token is something else. Appended after the
+    // existing fields so Swift call sites that only read members keep compiling.
+    bool argmax_is_eog;
 };
 
 enum class EngineStatus : int {
@@ -168,6 +174,11 @@ public:
     int getBatchSize() const;
     int getThreadCount() const;
     int getGPULayerCount() const;
+    // Number of vocabulary tokens that were hard-masked at model load because their rendered
+    // piece is chat/instruct/FIM scaffolding that the GGUF did not flag as a control token.
+    // 0 is the common (and healthy) case: well-formed GGUFs flag these as control already,
+    // and control tokens are masked by the base rule rather than counted here.
+    int getMaskedScaffoldingTokenCount() const;
 
 private:
     struct Impl;

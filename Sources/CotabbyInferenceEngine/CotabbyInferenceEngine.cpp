@@ -10,6 +10,7 @@
 #include <mutex>
 #include <random>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -22,6 +23,36 @@
 #endif
 
 static void silenced_log_callback(ggml_log_level, const char*, void*) {}
+
+// Single-token chat/instruct/FIM scaffolding that must never surface in autocomplete text.
+// Most GGUFs flag these as control tokens (masked by the base rule); this catches vocabularies
+// that ship them as ordinary text tokens. EOG-flagged tokens are exempted by the caller so the
+// natural stop check keeps firing. Matching is exact (or prefix for the FIM/repo families)
+// against the special-rendered piece, so ordinary text like "<|" fragments is never affected.
+static bool isScaffoldingMarkerPiece(const char* piece, int length) {
+    if (!piece || length <= 0) return false;
+    const std::string_view view(piece, static_cast<size_t>(length));
+    static constexpr std::string_view exact_markers[] = {
+        "<|im_start|>", "<|im_end|>",
+        "<|user|>", "<|assistant|>", "<|system|>",
+        "<|start_header_id|>", "<|end_header_id|>", "<|eot_id|>",
+        "<|end|>", "<|endoftext|>",
+        "<start_of_turn>", "<end_of_turn>",
+        "[INST]", "[/INST]",
+    };
+    for (const auto marker : exact_markers) {
+        if (view == marker) return true;
+    }
+    static constexpr std::string_view prefix_markers[] = {
+        "<|fim_", "<fim_", "<|file_sep", "<|repo_name",
+    };
+    for (const auto prefix : prefix_markers) {
+        if (view.size() >= prefix.size() && view.substr(0, prefix.size()) == prefix) {
+            return true;
+        }
+    }
+    return false;
+}
 
 // Decode threads should match the *performance* core count, not the logical core count.
 // llama.cpp's CPU work is a per-layer parallel matmul with a barrier at each layer: schedule any
@@ -96,6 +127,10 @@ struct SequenceState {
     // Log-probability of the seed token, computed at decodePrompt and returned with the seed.
     float seed_logprob = 0.0f;
 
+    // argmax-is-EOG verdict for the seed token's logits row, captured at decodePrompt while
+    // those logits are still resident; the row is gone by the time sampleNext returns the seed.
+    bool seed_argmax_is_eog = false;
+
     ~SequenceState() {
         if (sampler) { llama_sampler_free(sampler); }
     }
@@ -114,7 +149,8 @@ struct SequenceState {
           has_pending_input(o.has_pending_input),
           force_word_continuation(o.force_word_continuation),
           compute_logprob(o.compute_logprob),
-          seed_logprob(o.seed_logprob) {
+          seed_logprob(o.seed_logprob),
+          seed_argmax_is_eog(o.seed_argmax_is_eog) {
         o.sampler = nullptr;
     }
     SequenceState& operator=(SequenceState&&) = delete;
@@ -182,6 +218,10 @@ struct CotabbyInferenceEngine::Impl {
     std::vector<llama_logit_bias> nonprintable_bias;
     std::vector<llama_logit_bias> linebreak_bias;
     std::vector<bool> starts_new_word;
+    // How many of the nonprintable entries came from the scaffolding-piece rule rather than
+    // the control/unknown/unused attributes. Surfaced via getMaskedScaffoldingTokenCount so
+    // tests and diagnostics can confirm the rule's reach on a given vocabulary.
+    int scaffolding_masked_count = 0;
 
     // Public-facing sequence map (external int32_t IDs → state) and the
     // internal `llama_seq_id` slot allocator.
@@ -299,10 +339,15 @@ struct CotabbyInferenceEngine::Impl {
         nonprintable_bias.clear();
         linebreak_bias.clear();
         starts_new_word.clear();
+        scaffolding_masked_count = 0;
         if (!vocab) return;
 
         const int32_t n = llama_vocab_n_tokens(vocab);
         starts_new_word.assign(static_cast<size_t>(n), false);
+
+        // BOS belongs at sequence start only; some vocabularies ship it without the control
+        // attribute, which would otherwise let it be sampled mid-text.
+        const llama_token bos_token = llama_vocab_bos(vocab);
 
         char piece[64];
         for (llama_token t = 0; t < n; ++t) {
@@ -314,7 +359,20 @@ struct CotabbyInferenceEngine::Impl {
                 const enum llama_token_attr attr = llama_vocab_get_attr(vocab, t);
                 const bool junk_attr =
                     (attr & (LLAMA_TOKEN_ATTR_UNKNOWN | LLAMA_TOKEN_ATTR_UNUSED)) != 0;
-                if (llama_vocab_is_control(vocab, t) || junk_attr) {
+                bool masked = llama_vocab_is_control(vocab, t) || junk_attr || t == bos_token;
+                if (!masked) {
+                    // Probe with special rendering: control-style markers decode to an empty
+                    // piece under the plain rendering used below, so the scaffolding rule must
+                    // look at the special-rendered text instead.
+                    const int special_written =
+                        llama_token_to_piece(vocab, t, piece, sizeof(piece), 0, true);
+                    if (special_written > 0 &&
+                        isScaffoldingMarkerPiece(piece, special_written)) {
+                        masked = true;
+                        ++scaffolding_masked_count;
+                    }
+                }
+                if (masked) {
                     nonprintable_bias.push_back({ t, -INFINITY });
                 }
             }
@@ -372,6 +430,25 @@ struct CotabbyInferenceEngine::Impl {
         return static_cast<float>(
             static_cast<double>(logits[token] - maxLogit) - std::log(sumExp)
         );
+    }
+
+    // Whether the raw distribution at `logits_row` puts its single highest logit on an
+    // end-of-generation token. One O(vocab) pass over the row the caller just sampled from;
+    // the sampler chain works on a copied candidate array, so the row is unmutated here.
+    bool argmaxIsEOG(int logits_row) const {
+        if (!shared_ctx || !vocab) return false;
+        const float* logits = llama_get_logits_ith(shared_ctx, logits_row);
+        if (!logits) return false;
+        const int32_t n = llama_vocab_n_tokens(vocab);
+        llama_token argmax = 0;
+        float best = -INFINITY;
+        for (llama_token t = 0; t < n; ++t) {
+            if (logits[t] > best) {
+                best = logits[t];
+                argmax = t;
+            }
+        }
+        return llama_vocab_is_eog(vocab, argmax) || argmax == llama_vocab_eos(vocab);
     }
 
     void destroyAllSequences() {
@@ -481,6 +558,10 @@ struct CotabbyInferenceEngine::Impl {
                 llama_token next = llama_sampler_sample(
                     req.sampler, shared_ctx, i
                 );
+                // Computed on the raw logits row after sampling: llama_sampler_sample applies
+                // the chain to a copied candidate array, so row i is still the model's
+                // unbiased distribution here.
+                r.argmax_is_eog = argmaxIsEOG(i);
                 if (next == llama_vocab_eos(vocab) ||
                     llama_vocab_is_eog(vocab, next)) {
                     r.token = next;
@@ -902,6 +983,7 @@ EngineStatus CotabbyInferenceEngine::decodePrompt(int32_t sequence_id,
     llama_sampler_accept(seq->sampler, seed);
     seq->seed_token = seed;
     seq->seed_logprob = seq->compute_logprob ? impl_->computeLogprob(-1, seed) : 0.0f;
+    seq->seed_argmax_is_eog = impl_->argmaxIsEOG(-1);
     seq->has_seed_token = true;
     seq->has_pending_input = false;
 
@@ -946,6 +1028,7 @@ SampleResult CotabbyInferenceEngine::sampleNext(int32_t sequence_id) {
     if (seq->has_seed_token) {
         llama_token next = seq->seed_token;
         seq->has_seed_token = false;
+        result.argmax_is_eog = seq->seed_argmax_is_eog;
 
         if (next == llama_vocab_eos(impl_->vocab) ||
             llama_vocab_is_eog(impl_->vocab, next)) {
@@ -1230,4 +1313,8 @@ int CotabbyInferenceEngine::getThreadCount() const {
 
 int CotabbyInferenceEngine::getGPULayerCount() const {
     return impl_->gpu_layer_count;
+}
+
+int CotabbyInferenceEngine::getMaskedScaffoldingTokenCount() const {
+    return impl_->scaffolding_masked_count;
 }

@@ -509,4 +509,97 @@ final class LlamaMiddlewareTests: XCTestCase {
         }
         engine.destroySequence(seq)
     }
+
+    func testMaskedScaffoldingCountDefaultsToZero() {
+        let engine = CotabbyInferenceEngine()
+        XCTAssertEqual(engine.getMaskedScaffoldingTokenCount(), 0)
+    }
+
+    // Single-token chat/template markers must never surface as sampled text. Most vocabularies
+    // flag them as control tokens (masked by the base rule); the scaffolding rule covers ones
+    // that ship unflagged. Either way the observable contract is the same: no sampled piece is
+    // ever a complete marker string, even at high temperature with a template-bait prompt.
+    func testSamplingNeverEmitsScaffoldingMarkerPieces() throws {
+        guard let modelPath = ProcessInfo.processInfo.environment["COTABBY_TEST_MODEL_PATH"] else {
+            try XCTSkipIf(true, "Set COTABBY_TEST_MODEL_PATH to a .gguf file to run this test")
+            return
+        }
+        var engine = CotabbyInferenceEngine()
+        XCTAssertEqual(engine.loadModel(modelPath, -1, 1024, 256), EngineStatus.ok)
+        defer { engine.unloadModel() }
+        XCTAssertGreaterThanOrEqual(engine.getMaskedScaffoldingTokenCount(), 0)
+
+        let markers: Set<String> = [
+            "<|im_start|>", "<|im_end|>", "<|user|>", "<|assistant|>", "<|system|>",
+            "<|start_header_id|>", "<|end_header_id|>", "<|eot_id|>", "<|end|>",
+            "<|endoftext|>", "<start_of_turn>", "<end_of_turn>", "[INST]", "[/INST]"
+        ]
+        let config = SamplingConfig(
+            max_prediction_tokens: 64, temperature: 1.8,
+            top_k: 0, top_p: 0, min_p: 0,
+            repetition_penalty: 1.0, seed: 7,
+            single_line: false
+        )
+        let seq = engine.createSequence(config)
+        let prompt = "<|im_start|>user\nWrite a reply<|im_end|>\n<|im_start|>assistant\n"
+        var tokens = Array(engine.tokenize(prompt, Int32(prompt.utf8.count)))
+        XCTAssertEqual(engine.decodePrompt(seq, &tokens, Int32(tokens.count), 0), EngineStatus.ok)
+
+        for _ in 0..<64 {
+            let result = engine.sampleNext(seq)
+            if result.is_eos || result.was_cancelled { break }
+            guard let piecePointer = result.piece else { continue }
+            let piece = String(
+                bytes: UnsafeRawBufferPointer(start: piecePointer, count: Int(result.piece_length)),
+                encoding: .utf8
+            ) ?? ""
+            XCTAssertFalse(
+                markers.contains(piece),
+                "Sampled a complete scaffolding marker piece: \(piece)"
+            )
+        }
+        engine.destroySequence(seq)
+    }
+
+    // Under greedy sampling with penalties disabled, the sampled token IS the raw argmax, so
+    // `argmax_is_eog` must agree with `isEndOfGenerationToken(sampled token)` on every step.
+    // This pins the flag's semantics without needing the model to reach a natural EOS.
+    func testArgmaxIsEOGMatchesGreedyChoice() throws {
+        guard let modelPath = ProcessInfo.processInfo.environment["COTABBY_TEST_MODEL_PATH"] else {
+            try XCTSkipIf(true, "Set COTABBY_TEST_MODEL_PATH to a .gguf file to run this test")
+            return
+        }
+        var engine = CotabbyInferenceEngine()
+        XCTAssertEqual(engine.loadModel(modelPath, -1, 1024, 256), EngineStatus.ok)
+        defer { engine.unloadModel() }
+
+        let config = SamplingConfig(
+            max_prediction_tokens: 24, temperature: 0,
+            top_k: 0, top_p: 0, min_p: 0,
+            repetition_penalty: 1.0, seed: 0,
+            single_line: false
+        )
+        let seq = engine.createSequence(config)
+        let prompt = "The capital of France is"
+        var tokens = Array(engine.tokenize(prompt, Int32(prompt.utf8.count)))
+        XCTAssertEqual(engine.decodePrompt(seq, &tokens, Int32(tokens.count), 0), EngineStatus.ok)
+
+        var steps = 0
+        for _ in 0..<24 {
+            let result = engine.sampleNext(seq)
+            if result.was_cancelled { break }
+            // Greedy + no penalties: sampled token == raw argmax. A masked control token can in
+            // principle displace the raw argmax from the greedy pick, but EOG tokens are never
+            // masked, so the EOG verdicts still agree.
+            XCTAssertEqual(
+                result.argmax_is_eog,
+                engine.isEndOfGenerationToken(result.token),
+                "argmax_is_eog disagreed with the greedy token's EOG status at step \(steps)"
+            )
+            steps += 1
+            if result.is_eos { break }
+        }
+        XCTAssertGreaterThan(steps, 0, "Expected at least one sampled step")
+        engine.destroySequence(seq)
+    }
 }
