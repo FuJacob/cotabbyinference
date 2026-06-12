@@ -201,6 +201,15 @@ struct CotabbyInferenceEngine::Impl {
     // chosen as a starting point and should be tuned via the bench.
     static constexpr int BATCH_WINDOW_MICROS = 200;
 
+    // Lock-free mirror of `sequences.size()` for the decoder thread's flush
+    // decision. The decoder holds `decode_mutex` at that point, and taking
+    // `sequences_mutex` inside it would create a lock-order hazard with
+    // `destroySequence` (which nests decode_mutex inside sequences scope);
+    // an atomic mirror avoids nesting entirely. Updated under
+    // `sequences_mutex` at every map mutation, so it can lag a concurrent
+    // create/destroy by at most one flush decision.
+    std::atomic<int> live_sequence_count{0};
+
     llama_model* model = nullptr;
     const llama_vocab* vocab = nullptr;
     bool backend_initialized = false;
@@ -457,6 +466,7 @@ struct CotabbyInferenceEngine::Impl {
             releaseSeqSlot(seq.seq_id);
         }
         sequences.clear();
+        live_sequence_count.store(0, std::memory_order_release);
     }
 
     void startDecoderThread() {
@@ -497,11 +507,17 @@ struct CotabbyInferenceEngine::Impl {
                 // llama_decode can batch them together. Multi-sequence
                 // workloads naturally fall into lockstep here because each
                 // sequence resubmits as soon as its previous sample returns.
-                request_cv.wait_for(
-                    lock,
-                    std::chrono::microseconds(BATCH_WINDOW_MICROS),
-                    [&] { return decoder_should_stop; }
-                );
+                // With at most one live sequence there is no sibling to wait
+                // for, so the window is pure added latency on every sampled
+                // token (the autocomplete app holds exactly one sequence);
+                // skip it and flush immediately.
+                if (live_sequence_count.load(std::memory_order_acquire) > 1) {
+                    request_cv.wait_for(
+                        lock,
+                        std::chrono::microseconds(BATCH_WINDOW_MICROS),
+                        [&] { return decoder_should_stop; }
+                    );
+                }
 
                 if (pending.empty()) {
                     if (decoder_should_stop) return;
@@ -748,6 +764,8 @@ int32_t CotabbyInferenceEngine::createSequence(SamplingConfig config) {
 
     int32_t id = impl_->next_external_id++;
     impl_->sequences.emplace(id, std::move(state));
+    impl_->live_sequence_count.store(
+        static_cast<int>(impl_->sequences.size()), std::memory_order_release);
     return id;
 }
 
@@ -782,6 +800,8 @@ void CotabbyInferenceEngine::destroySequence(int32_t sequence_id) {
     if (it != impl_->sequences.end()) {
         impl_->releaseSeqSlot(it->second.seq_id);
         impl_->sequences.erase(it);
+        impl_->live_sequence_count.store(
+            static_cast<int>(impl_->sequences.size()), std::memory_order_release);
     }
 }
 
