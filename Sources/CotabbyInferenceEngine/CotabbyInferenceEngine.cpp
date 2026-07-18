@@ -2,17 +2,13 @@
 
 #include <algorithm>
 #include <atomic>
-#include <chrono>
 #include <cmath>
-#include <condition_variable>
-#include <cstring>
-#include <future>
+#include <memory>
 #include <mutex>
 #include <random>
 #include <string>
 #include <string_view>
 #include <thread>
-#include <unordered_map>
 #include <vector>
 
 #include <llama/llama.h>
@@ -84,13 +80,11 @@ static int resolveDecodeThreadCount() {
 }
 
 // ---------------------------------------------------------------------------
-// Per-sequence state
+// Sequence state
 //
-// Phase 1 architecture: all sequences share a single `llama_context` allocated
-// in `Impl`. Each sequence owns its own sampler chain, KV-cache position
-// counter, cancellation flag, and detokenization buffer. The `seq_id` is the
-// internal `llama_seq_id` slot (0..MAX_SEQUENCES-1) used to tag this
-// sequence's tokens in the shared KV cache.
+// Cotabby owns one autocomplete stream, so the engine owns at most one live sequence. The public
+// ID still changes each time a sequence is created; that prevents a late cancellation from
+// targeting a replacement sequence that reuses llama's fixed internal slot 0.
 //
 // `seed_token` / `has_seed_token` carries the first sample produced by
 // `decodePrompt`. We sample it right after the prompt's final decode while
@@ -103,9 +97,8 @@ static int resolveDecodeThreadCount() {
 // ---------------------------------------------------------------------------
 
 struct SequenceState {
-    llama_seq_id seq_id = -1;
+    int32_t external_id = -1;
     llama_sampler* sampler = nullptr;
-    SamplingConfig config{};
     int kv_position_count = 0;
     std::atomic<bool> cancelled{false};
     std::string last_piece;
@@ -135,50 +128,6 @@ struct SequenceState {
         if (sampler) { llama_sampler_free(sampler); }
     }
 
-    SequenceState() = default;
-    SequenceState(SequenceState&& o) noexcept
-        : seq_id(o.seq_id),
-          sampler(o.sampler),
-          config(o.config),
-          kv_position_count(o.kv_position_count),
-          cancelled(o.cancelled.load()),
-          last_piece(std::move(o.last_piece)),
-          seed_token(o.seed_token),
-          has_seed_token(o.has_seed_token),
-          pending_input_token(o.pending_input_token),
-          has_pending_input(o.has_pending_input),
-          force_word_continuation(o.force_word_continuation),
-          compute_logprob(o.compute_logprob),
-          seed_logprob(o.seed_logprob),
-          seed_argmax_is_eog(o.seed_argmax_is_eog) {
-        o.sampler = nullptr;
-    }
-    SequenceState& operator=(SequenceState&&) = delete;
-    SequenceState(const SequenceState&) = delete;
-    SequenceState& operator=(const SequenceState&) = delete;
-};
-
-// ---------------------------------------------------------------------------
-// Pending decode + sample request handed to the decoder thread.
-//
-// Holds raw pointers into a SequenceState entry. SequenceState entries live in
-// a node-based unordered_map (stable addresses across inserts), and the
-// public contract forbids destroying a sequence with sampleNext in flight, so
-// the pointers stay valid for the request's lifetime.
-// ---------------------------------------------------------------------------
-
-struct PendingRequest {
-    llama_seq_id seq_id = -1;
-    llama_token token = 0;
-    int position = 0;
-    llama_sampler* sampler = nullptr;
-    std::atomic<bool>* cancelled_ptr = nullptr;
-    std::string* piece_buffer = nullptr;
-    SampleResult* result_out = nullptr;
-    // Snapshot of the sequence's compute_logprob flag at staging time, so the decoder thread
-    // never has to re-resolve the sequence entry.
-    bool compute_logprob = true;
-    std::promise<void> done;
 };
 
 // ---------------------------------------------------------------------------
@@ -186,29 +135,7 @@ struct PendingRequest {
 // ---------------------------------------------------------------------------
 
 struct CotabbyInferenceEngine::Impl {
-    // Concurrent sequence slots. The shared context's KV allocation scales linearly with this
-    // (n_ctx = context_window_tokens * MAX_SEQUENCES), so every unused slot is resident RAM —
-    // hundreds of MB at a 2048-token window on multi-GB models. The app holds at most ONE live
-    // sequence (it destroys the old autocomplete sequence before building a fresh one); 2 keeps
-    // one spare slot for a concurrent secondary consumer (e.g. an eval or test driving two
-    // sequences side by side) without paying for two more that nothing has ever used.
-    static constexpr int MAX_SEQUENCES = 2;
-
-    // Microseconds the decoder thread waits after the first request arrives
-    // before flushing. This is the knob that lets multi-sequence callers pile
-    // up tokens for a batched `llama_decode`. Too short → no batching; too
-    // long → single-sequence callers feel extra latency per token. 200µs was
-    // chosen as a starting point and should be tuned via the bench.
-    static constexpr int BATCH_WINDOW_MICROS = 200;
-
-    // Lock-free mirror of `sequences.size()` for the decoder thread's flush
-    // decision. The decoder holds `decode_mutex` at that point, and taking
-    // `sequences_mutex` inside it would create a lock-order hazard with
-    // `destroySequence` (which nests decode_mutex inside sequences scope);
-    // an atomic mirror avoids nesting entirely. Updated under
-    // `sequences_mutex` at every map mutation, so it can lag a concurrent
-    // create/destroy by at most one flush decision.
-    std::atomic<int> live_sequence_count{0};
+    static constexpr llama_seq_id SEQUENCE_ID = 0;
 
     llama_model* model = nullptr;
     const llama_vocab* vocab = nullptr;
@@ -227,55 +154,26 @@ struct CotabbyInferenceEngine::Impl {
     std::vector<llama_logit_bias> nonprintable_bias;
     std::vector<llama_logit_bias> linebreak_bias;
     std::vector<bool> starts_new_word;
-    // How many of the nonprintable entries came from the scaffolding-piece rule rather than
-    // the control/unknown/unused attributes. Surfaced via getMaskedScaffoldingTokenCount so
-    // tests and diagnostics can confirm the rule's reach on a given vocabulary.
-    int scaffolding_masked_count = 0;
 
-    // Public-facing sequence map (external int32_t IDs → state) and the
-    // internal `llama_seq_id` slot allocator.
-    mutable std::mutex sequences_mutex;
-    std::unordered_map<int32_t, SequenceState> sequences;
+    // One product sequence with a monotonically changing external identity. The mutex protects
+    // create/destroy and lookup; callers still must not destroy the sequence while another method
+    // is using the returned state pointer.
+    mutable std::mutex sequence_mutex;
+    std::unique_ptr<SequenceState> sequence;
     int32_t next_external_id = 1;
-    bool seq_slot_in_use[MAX_SEQUENCES] = {false};
 
-    // Decoder thread. Owns all `llama_decode` calls on `shared_ctx` after
-    // model load, including both sample-step batches (built from
-    // `sampleNext` requests) and prompt-decode chunks (forwarded from
-    // `decodePrompt` via the same queue path).
+    // Serializes every llama context mutation. Cotabby's Swift wrapper already orders generation,
+    // prefill, trim, and reset, while cancellation only touches the sequence's atomic flag.
     std::mutex decode_mutex;
-    std::condition_variable request_cv;
-    std::vector<PendingRequest> pending;
-    std::thread decoder_thread;
-    bool decoder_should_stop = false;
-    bool decoder_running = false;
-
-    int allocateSeqSlot() {
-        for (int i = 0; i < MAX_SEQUENCES; ++i) {
-            if (!seq_slot_in_use[i]) {
-                seq_slot_in_use[i] = true;
-                return i;
-            }
-        }
-        return -1;
-    }
-
-    void releaseSeqSlot(int slot) {
-        if (slot >= 0 && slot < MAX_SEQUENCES) {
-            seq_slot_in_use[slot] = false;
-        }
-    }
 
     SequenceState* findSequence(int32_t id) {
-        std::lock_guard<std::mutex> lock(sequences_mutex);
-        auto it = sequences.find(id);
-        return it != sequences.end() ? &it->second : nullptr;
+        std::lock_guard<std::mutex> lock(sequence_mutex);
+        return sequence && sequence->external_id == id ? sequence.get() : nullptr;
     }
 
     const SequenceState* findSequence(int32_t id) const {
-        std::lock_guard<std::mutex> lock(sequences_mutex);
-        auto it = sequences.find(id);
-        return it != sequences.end() ? &it->second : nullptr;
+        std::lock_guard<std::mutex> lock(sequence_mutex);
+        return sequence && sequence->external_id == id ? sequence.get() : nullptr;
     }
 
     llama_sampler* buildSampler(const SamplingConfig& cfg) const {
@@ -286,7 +184,7 @@ struct CotabbyInferenceEngine::Impl {
         // Quality mask: control/unknown/unused tokens can never be sampled as visible text, and
         // for single-line fields line-break tokens are masked too. Placed first so the -inf bias
         // is absolute regardless of the temperature/top-k stages that follow. EOG is intentionally
-        // left sampleable so the stop check in processBatch/sampleNext still fires.
+        // left sampleable so the stop check in sampleNext still fires.
         std::vector<llama_logit_bias> mask = nonprintable_bias;
         if (cfg.single_line && !linebreak_bias.empty()) {
             mask.insert(mask.end(), linebreak_bias.begin(), linebreak_bias.end());
@@ -348,7 +246,6 @@ struct CotabbyInferenceEngine::Impl {
         nonprintable_bias.clear();
         linebreak_bias.clear();
         starts_new_word.clear();
-        scaffolding_masked_count = 0;
         if (!vocab) return;
 
         const int32_t n = llama_vocab_n_tokens(vocab);
@@ -378,7 +275,6 @@ struct CotabbyInferenceEngine::Impl {
                     if (special_written > 0 &&
                         isScaffoldingMarkerPiece(piece, special_written)) {
                         masked = true;
-                        ++scaffolding_masked_count;
                     }
                 }
                 if (masked) {
@@ -460,156 +356,9 @@ struct CotabbyInferenceEngine::Impl {
         return llama_vocab_is_eog(vocab, argmax) || argmax == llama_vocab_eos(vocab);
     }
 
-    void destroyAllSequences() {
-        std::lock_guard<std::mutex> lock(sequences_mutex);
-        for (auto& [id, seq] : sequences) {
-            releaseSeqSlot(seq.seq_id);
-        }
-        sequences.clear();
-        live_sequence_count.store(0, std::memory_order_release);
-    }
-
-    void startDecoderThread() {
-        if (decoder_running) return;
-        decoder_should_stop = false;
-        decoder_running = true;
-        decoder_thread = std::thread([this]() { decoderRun(); });
-    }
-
-    void stopDecoderThread() {
-        if (!decoder_running) return;
-        {
-            std::lock_guard<std::mutex> lock(decode_mutex);
-            decoder_should_stop = true;
-        }
-        request_cv.notify_all();
-        if (decoder_thread.joinable()) {
-            decoder_thread.join();
-        }
-        decoder_running = false;
-    }
-
-    // Decoder loop: collect pending sample-step requests, batch them into one
-    // llama_decode, sample each sequence's next token using its own sampler,
-    // and resolve every request's promise so the caller threads can return.
-    void decoderRun() {
-        while (true) {
-            std::vector<PendingRequest> batch;
-            {
-                std::unique_lock<std::mutex> lock(decode_mutex);
-                request_cv.wait(lock, [&] {
-                    return decoder_should_stop || !pending.empty();
-                });
-                if (decoder_should_stop && pending.empty()) return;
-
-                // Brief flush window: when only one request has arrived,
-                // wait a short period for siblings to pile in so the next
-                // llama_decode can batch them together. Multi-sequence
-                // workloads naturally fall into lockstep here because each
-                // sequence resubmits as soon as its previous sample returns.
-                // With at most one live sequence there is no sibling to wait
-                // for, so the window is pure added latency on every sampled
-                // token (the autocomplete app holds exactly one sequence);
-                // skip it and flush immediately.
-                if (live_sequence_count.load(std::memory_order_acquire) > 1) {
-                    request_cv.wait_for(
-                        lock,
-                        std::chrono::microseconds(BATCH_WINDOW_MICROS),
-                        [&] { return decoder_should_stop; }
-                    );
-                }
-
-                if (pending.empty()) {
-                    if (decoder_should_stop) return;
-                    continue;
-                }
-
-                batch = std::move(pending);
-                pending.clear();
-
-                // Process while still holding decode_mutex so prompt-decode
-                // calls in `decodePrompt` cannot race with the sample-step
-                // llama_decode below. llama_decode + sampling for a small
-                // batch is ~10ms; callers blocked on staging will simply
-                // queue for the next cycle.
-                processBatch(batch);
-            }
-        }
-    }
-
-    void processBatch(std::vector<PendingRequest>& reqs) {
-        if (reqs.empty() || !shared_ctx) return;
-
-        llama_batch batch = llama_batch_init(
-            static_cast<int32_t>(reqs.size() + 4), 0, 1
-        );
-        batch.n_tokens = static_cast<int32_t>(reqs.size());
-        for (int i = 0; i < static_cast<int>(reqs.size()); ++i) {
-            batch.token[i] = reqs[i].token;
-            batch.pos[i] = static_cast<llama_pos>(reqs[i].position);
-            batch.n_seq_id[i] = 1;
-            if (batch.seq_id && batch.seq_id[i]) {
-                batch.seq_id[i][0] = reqs[i].seq_id;
-            }
-            batch.logits[i] = 1;
-        }
-
-        int status = llama_decode(shared_ctx, batch);
-
-        for (int i = 0; i < static_cast<int>(reqs.size()); ++i) {
-            PendingRequest& req = reqs[i];
-            SampleResult r{};
-            r.token = 0;
-            r.piece = nullptr;
-            r.piece_length = 0;
-            r.is_eos = false;
-            r.was_cancelled = false;
-
-            if (status != 0) {
-                r.is_eos = true;
-            } else if (req.cancelled_ptr &&
-                       req.cancelled_ptr->load(std::memory_order_acquire)) {
-                r.was_cancelled = true;
-            } else {
-                llama_token next = llama_sampler_sample(
-                    req.sampler, shared_ctx, i
-                );
-                // Computed on the raw logits row after sampling: llama_sampler_sample applies
-                // the chain to a copied candidate array, so row i is still the model's
-                // unbiased distribution here.
-                r.argmax_is_eog = argmaxIsEOG(i);
-                if (next == llama_vocab_eos(vocab) ||
-                    llama_vocab_is_eog(vocab, next)) {
-                    r.token = next;
-                    r.is_eos = true;
-                } else {
-                    llama_sampler_accept(req.sampler, next);
-
-                    std::string& piece = *req.piece_buffer;
-                    piece.resize(64);
-                    while (true) {
-                        int written = llama_token_to_piece(
-                            vocab, next, piece.data(),
-                            static_cast<int32_t>(piece.size()), 0, false
-                        );
-                        if (written >= 0) { piece.resize(written); break; }
-                        piece.resize(static_cast<size_t>(-written) + 1);
-                    }
-
-                    r.token = next;
-                    r.piece = piece.c_str();
-                    r.piece_length = static_cast<int>(piece.size());
-                    // Two O(vocab) passes per token — skip entirely when the caller's confidence
-                    // gate is off and the value would be discarded.
-                    r.logprob = req.compute_logprob ? computeLogprob(i, next) : 0.0f;
-                }
-            }
-
-            *req.result_out = r;
-            req.done.set_value();
-        }
-
-        llama_batch_free(batch);
+    void destroySequenceState() {
+        std::lock_guard<std::mutex> lock(sequence_mutex);
+        sequence.reset();
     }
 };
 
@@ -680,18 +429,13 @@ EngineStatus CotabbyInferenceEngine::loadModel(const char* path, int gpu_layers,
     // burns extra package power for nothing when layers are Metal-offloaded anyway.
     impl_->thread_count = resolveDecodeThreadCount();
 
-    // Shared context sized to hold MAX_SEQUENCES sequences each with up to
-    // `context_window_tokens` KV slots. llama.cpp's `n_ctx` is the total slot
-    // budget across all sequences in a context, so we multiply to give each
-    // sequence the configured window without sequences stealing slots from
-    // each other.
+    // Cotabby has one autocomplete sequence, so the configured context window is the complete KV
+    // budget. Reserving a second unused llama sequence used to double this allocation.
     auto ctx_params = llama_context_default_params();
-    ctx_params.n_ctx = static_cast<uint32_t>(
-        context_window_tokens * Impl::MAX_SEQUENCES
-    );
+    ctx_params.n_ctx = static_cast<uint32_t>(context_window_tokens);
     ctx_params.n_batch = static_cast<uint32_t>(batch_size);
     ctx_params.n_ubatch = static_cast<uint32_t>(batch_size);
-    ctx_params.n_seq_max = static_cast<uint32_t>(Impl::MAX_SEQUENCES);
+    ctx_params.n_seq_max = 1;
     ctx_params.n_threads = static_cast<int32_t>(impl_->thread_count);
     ctx_params.n_threads_batch = static_cast<int32_t>(impl_->thread_count);
     ctx_params.offload_kqv = true;
@@ -708,15 +452,13 @@ EngineStatus CotabbyInferenceEngine::loadModel(const char* path, int gpu_layers,
     // createSequence read these, and the hot path then needs no per-token tokenizer work.
     impl_->buildTokenMasks();
 
-    impl_->startDecoderThread();
     return EngineStatus::ok;
 }
 
 void CotabbyInferenceEngine::unloadModel() {
     if (!impl_) return;
 
-    impl_->stopDecoderThread();
-    impl_->destroyAllSequences();
+    impl_->destroySequenceState();
 
     if (impl_->shared_ctx) {
         llama_free(impl_->shared_ctx);
@@ -736,10 +478,6 @@ void CotabbyInferenceEngine::unloadModel() {
     }
 }
 
-bool CotabbyInferenceEngine::isModelLoaded() const {
-    return impl_ && impl_->model != nullptr && impl_->shared_ctx != nullptr;
-}
-
 // ---------------------------------------------------------------------------
 // Sequence lifecycle
 // ---------------------------------------------------------------------------
@@ -747,62 +485,36 @@ bool CotabbyInferenceEngine::isModelLoaded() const {
 int32_t CotabbyInferenceEngine::createSequence(SamplingConfig config) {
     if (!impl_->model || !impl_->shared_ctx) return -1;
 
-    std::lock_guard<std::mutex> lock(impl_->sequences_mutex);
-    int slot = impl_->allocateSeqSlot();
-    if (slot < 0) return -1;
+    std::lock_guard<std::mutex> lock(impl_->sequence_mutex);
+    if (impl_->sequence) return -1;
 
     llama_sampler* sampler = impl_->buildSampler(config);
-    if (!sampler) {
-        impl_->releaseSeqSlot(slot);
-        return -1;
-    }
-
-    SequenceState state;
-    state.seq_id = static_cast<llama_seq_id>(slot);
-    state.sampler = sampler;
-    state.config = config;
+    if (!sampler) return -1;
 
     int32_t id = impl_->next_external_id++;
-    impl_->sequences.emplace(id, std::move(state));
-    impl_->live_sequence_count.store(
-        static_cast<int>(impl_->sequences.size()), std::memory_order_release);
+    auto state = std::make_unique<SequenceState>();
+    state->external_id = id;
+    state->sampler = sampler;
+    impl_->sequence = std::move(state);
     return id;
 }
 
 void CotabbyInferenceEngine::destroySequence(int32_t sequence_id) {
     if (!impl_) return;
 
-    // Look up the internal slot once. Caller's contract is to not destroy a
-    // sequence with sampleNext in flight, so the entry is stable for the
-    // duration of this call.
-    llama_seq_id slot_to_wipe = -1;
-    {
-        std::lock_guard<std::mutex> seq_lock(impl_->sequences_mutex);
-        auto it = impl_->sequences.find(sequence_id);
-        if (it == impl_->sequences.end()) return;
-        slot_to_wipe = it->second.seq_id;
-    }
+    std::lock_guard<std::mutex> sequence_lock(impl_->sequence_mutex);
+    if (!impl_->sequence || impl_->sequence->external_id != sequence_id) return;
 
-    // Wipe this sequence's KV slots in the shared context before releasing
-    // the slot, otherwise stale positions linger and reusing the slot later
-    // would mix old tokens with new ones. Hold decode_mutex so the wipe does
-    // not race with the decoder thread's llama_decode call.
-    if (impl_->shared_ctx && slot_to_wipe >= 0) {
+    // Wipe slot 0 before a replacement sequence can reuse it. The caller must not destroy a
+    // sequence while decode/sample is using it; decode_mutex protects the llama context mutation.
+    if (impl_->shared_ctx) {
         std::lock_guard<std::mutex> decode_lock(impl_->decode_mutex);
         llama_memory_t memory = llama_get_memory(impl_->shared_ctx);
         if (memory) {
-            llama_memory_seq_rm(memory, slot_to_wipe, 0, -1);
+            llama_memory_seq_rm(memory, Impl::SEQUENCE_ID, 0, -1);
         }
     }
-
-    std::lock_guard<std::mutex> seq_lock(impl_->sequences_mutex);
-    auto it = impl_->sequences.find(sequence_id);
-    if (it != impl_->sequences.end()) {
-        impl_->releaseSeqSlot(it->second.seq_id);
-        impl_->sequences.erase(it);
-        impl_->live_sequence_count.store(
-            static_cast<int>(impl_->sequences.size()), std::memory_order_release);
-    }
+    impl_->sequence.reset();
 }
 
 // ---------------------------------------------------------------------------
@@ -811,19 +523,11 @@ void CotabbyInferenceEngine::destroySequence(int32_t sequence_id) {
 
 std::vector<int32_t> CotabbyInferenceEngine::tokenize(const char* text,
                                                      int text_length) const {
-    // Preserve the historical contract: add BOS per model metadata, treat any
-    // special-token text as plaintext (parse_special = false).
-    bool add_bos = impl_->vocab ? llama_vocab_get_add_bos(impl_->vocab) : false;
-    return tokenizeWithOptions(text, text_length, add_bos, false);
-}
-
-std::vector<int32_t> CotabbyInferenceEngine::tokenizeWithOptions(
-    const char* text, int text_length,
-    bool add_special, bool parse_special) const {
     if (!impl_->vocab || !text || text_length <= 0) {
         return {};
     }
 
+    const bool add_bos = llama_vocab_get_add_bos(impl_->vocab);
     int capacity = text_length + 8;
 
     while (true) {
@@ -834,8 +538,8 @@ std::vector<int32_t> CotabbyInferenceEngine::tokenizeWithOptions(
             static_cast<int32_t>(text_length),
             tokens.data(),
             static_cast<int32_t>(capacity),
-            add_special,
-            parse_special
+            add_bos,
+            false
         );
 
         if (n > 0) {
@@ -849,80 +553,11 @@ std::vector<int32_t> CotabbyInferenceEngine::tokenizeWithOptions(
     }
 }
 
-bool CotabbyInferenceEngine::hasChatTemplate() const {
-    if (!impl_->model) {
-        return false;
-    }
-    return llama_model_chat_template(impl_->model, /*name=*/nullptr) != nullptr;
-}
-
-int CotabbyInferenceEngine::applyChatTemplate(
-    const char* system_text,
-    const char* user_text,
-    bool add_assistant,
-    char* buffer,
-    int buffer_size) const {
-    if (!impl_->model || !system_text || !user_text ||
-        !buffer || buffer_size <= 0) {
-        return 0;
-    }
-
-    const char* tmpl = llama_model_chat_template(impl_->model, /*name=*/nullptr);
-    if (!tmpl) {
-        return 0;
-    }
-
-    // Borrowed `const char*` from the caller; valid for this call's duration.
-    llama_chat_message chat[2] = {
-        { "system", system_text },
-        { "user", user_text }
-    };
-
-    int32_t n = llama_chat_apply_template(
-        tmpl,
-        chat,
-        2,
-        add_assistant,
-        buffer,
-        static_cast<int32_t>(buffer_size)
-    );
-
-    // Contract of llama_chat_apply_template: returns the total byte length of
-    // the formatted prompt; negative means the template is unsupported by
-    // llama.cpp's predefined list. A positive value larger than the buffer
-    // means the output did not fit and the caller must retry with a bigger
-    // buffer. Map all three onto this function's documented C-ABI contract.
-    if (n < 0) {
-        return 0;              // genuine render failure → caller falls back to raw
-    }
-    if (n > buffer_size) {
-        return -n;             // too small → -(required size); caller resizes and retries
-    }
-    return n;                  // success: n bytes written (n <= buffer_size)
-}
-
-int CotabbyInferenceEngine::detokenize(int32_t token, char* buffer,
-                                      int buffer_size) const {
-    if (!impl_->vocab || !buffer || buffer_size <= 0) return 0;
-
-    int written = llama_token_to_piece(
-        impl_->vocab,
-        token,
-        buffer,
-        static_cast<int32_t>(buffer_size),
-        0,
-        false
-    );
-
-    return written;
-}
-
 // ---------------------------------------------------------------------------
 // Prompt decoding
 //
-// Prompt decode runs synchronously on the calling thread, but takes
-// `decode_mutex` so it serializes with the decoder thread's sample-step
-// llama_decode calls. After the prompt's final decode succeeds, we
+// Prompt decode runs synchronously on the calling thread under `decode_mutex`. After the prompt's
+// final decode succeeds, we
 // immediately sample one "seed" token using this sequence's sampler while
 // the prompt's logits are still live in the shared context. That seed is
 // handed back via the very next `sampleNext` call without any further
@@ -970,7 +605,7 @@ EngineStatus CotabbyInferenceEngine::decodePrompt(int32_t sequence_id,
             batch.pos[i] = static_cast<llama_pos>(start_position + token_index);
             batch.n_seq_id[i] = 1;
             if (batch.seq_id && batch.seq_id[i]) {
-                batch.seq_id[i][0] = seq->seq_id;
+                batch.seq_id[i][0] = Impl::SEQUENCE_ID;
             }
             bool is_last = (chunk_end == end && i == chunk_size - 1);
             batch.logits[i] = is_last ? 1 : 0;
@@ -995,10 +630,8 @@ EngineStatus CotabbyInferenceEngine::decodePrompt(int32_t sequence_id,
         seq->force_word_continuation = false;
     }
 
-    // Seed sample: take one token from the prompt's logits row right now,
-    // before any other sequence's decode can overwrite the shared logits
-    // buffer. The seed will be returned by the next sampleNext call as-is
-    // and feedback-decoded by the call after that.
+    // Seed sample: take one token from the prompt's final logits row. The seed will be returned by
+    // the next sampleNext call as-is and feedback-decoded by the call after that.
     llama_token seed = llama_sampler_sample(seq->sampler, impl_->shared_ctx, -1);
     llama_sampler_accept(seq->sampler, seed);
     seq->seed_token = seed;
@@ -1013,9 +646,8 @@ EngineStatus CotabbyInferenceEngine::decodePrompt(int32_t sequence_id,
 // ---------------------------------------------------------------------------
 // Sampling
 //
-// First call after decodePrompt: return the seed token directly (no decode
-// queued). Subsequent calls: queue the previously sampled token for feedback
-// decode via the decoder thread, then return its sampled result.
+// First call after decodePrompt returns the seed token directly. Subsequent calls synchronously
+// feedback-decode the previously sampled token, then sample and return the next one.
 // ---------------------------------------------------------------------------
 
 SampleResult CotabbyInferenceEngine::sampleNext(int32_t sequence_id) {
@@ -1067,8 +699,8 @@ SampleResult CotabbyInferenceEngine::sampleNext(int32_t sequence_id) {
             seq->last_piece.resize(static_cast<size_t>(-written) + 1);
         }
 
-        // The seed has not yet been added to KV. Queue it as the next
-        // feedback-decode input so the call after this one has fresh logits.
+        // The seed has not yet been added to KV. Remember it as the next feedback-decode input so
+        // the call after this one can produce fresh logits.
         seq->pending_input_token = next;
         seq->has_pending_input = true;
 
@@ -1086,28 +718,56 @@ SampleResult CotabbyInferenceEngine::sampleNext(int32_t sequence_id) {
         return result;
     }
 
-    // Steady-state path: queue the previously sampled token (or the seed,
-    // if this is the call right after the seed was delivered) for feedback
-    // decode via the decoder thread, which batches it with any other
-    // sequences that happen to be sampling at the same time.
-    PendingRequest req;
-    req.seq_id = seq->seq_id;
-    req.token = seq->pending_input_token;
-    req.position = seq->kv_position_count;
-    req.sampler = seq->sampler;
-    req.cancelled_ptr = &seq->cancelled;
-    req.piece_buffer = &seq->last_piece;
-    req.result_out = &result;
-    req.compute_logprob = seq->compute_logprob;
-    auto done_future = req.done.get_future();
-
-    {
-        std::lock_guard<std::mutex> lock(impl_->decode_mutex);
-        impl_->pending.push_back(std::move(req));
-        impl_->request_cv.notify_one();
+    // Cotabby has no sibling sequence to batch with, so feedback decode happens directly on the
+    // calling worker under the same context lock used by prompt decode and KV mutation.
+    std::lock_guard<std::mutex> lock(impl_->decode_mutex);
+    llama_batch batch = llama_batch_init(1, 0, 1);
+    batch.n_tokens = 1;
+    batch.token[0] = seq->pending_input_token;
+    batch.pos[0] = static_cast<llama_pos>(seq->kv_position_count);
+    batch.n_seq_id[0] = 1;
+    if (batch.seq_id && batch.seq_id[0]) {
+        batch.seq_id[0][0] = Impl::SEQUENCE_ID;
     }
+    batch.logits[0] = 1;
 
-    done_future.wait();
+    const int status = llama_decode(impl_->shared_ctx, batch);
+    if (status != 0) {
+        result.is_eos = true;
+    } else if (seq->cancelled.load(std::memory_order_acquire)) {
+        result.was_cancelled = true;
+    } else {
+        const llama_token next = llama_sampler_sample(seq->sampler, impl_->shared_ctx, 0);
+        result.argmax_is_eog = impl_->argmaxIsEOG(0);
+        result.token = next;
+
+        if (next == llama_vocab_eos(impl_->vocab) ||
+            llama_vocab_is_eog(impl_->vocab, next)) {
+            result.is_eos = true;
+        } else {
+            llama_sampler_accept(seq->sampler, next);
+            seq->last_piece.resize(64);
+            while (true) {
+                const int written = llama_token_to_piece(
+                    impl_->vocab,
+                    next,
+                    seq->last_piece.data(),
+                    static_cast<int32_t>(seq->last_piece.size()),
+                    0,
+                    false
+                );
+                if (written >= 0) {
+                    seq->last_piece.resize(written);
+                    break;
+                }
+                seq->last_piece.resize(static_cast<size_t>(-written) + 1);
+            }
+            result.piece = seq->last_piece.c_str();
+            result.piece_length = static_cast<int>(seq->last_piece.size());
+            result.logprob = seq->compute_logprob ? impl_->computeLogprob(0, next) : 0.0f;
+        }
+    }
+    llama_batch_free(batch);
 
     if (result.is_eos || result.was_cancelled) {
         return result;
@@ -1122,94 +782,6 @@ SampleResult CotabbyInferenceEngine::sampleNext(int32_t sequence_id) {
 }
 
 // ---------------------------------------------------------------------------
-// Constrained generation primitives
-//
-// These let a Swift caller run the select-then-commit loop manually instead of
-// using sampleNext: read the logits row, classify/choose a token under its own
-// constraints, then commit the choice with acceptToken. The vocab queries are
-// pure reads on the loaded vocab; getNextTokenLogits copies the live logits row
-// (still resident from the last decode); acceptToken mirrors the KV-advancing
-// decode used elsewhere so the shared context produces fresh logits afterward.
-// ---------------------------------------------------------------------------
-
-int CotabbyInferenceEngine::getVocabSize() const {
-    // No vocab means no model loaded; report 0 so callers don't size buffers off a stale value.
-    if (!impl_ || !impl_->vocab) return 0;
-    return llama_vocab_n_tokens(impl_->vocab);
-}
-
-bool CotabbyInferenceEngine::isEndOfGenerationToken(int32_t token) const {
-    if (!impl_ || !impl_->vocab) return false;
-    return llama_vocab_is_eog(impl_->vocab, token);
-}
-
-int32_t CotabbyInferenceEngine::endOfSequenceToken() const {
-    // -1 is not a valid token id, so it doubles as the "no model" sentinel.
-    if (!impl_ || !impl_->vocab) return -1;
-    return llama_vocab_eos(impl_->vocab);
-}
-
-int CotabbyInferenceEngine::getNextTokenLogits(int32_t sequence_id,
-                                              float* out, int out_capacity) const {
-    if (!impl_ || !impl_->vocab || !impl_->shared_ctx || !out) return 0;
-
-    const SequenceState* seq = impl_->findSequence(sequence_id);
-    if (!seq) return 0;
-
-    // Refuse to write past the caller's buffer; the full vocab-size row is all-or-nothing.
-    const int32_t n = llama_vocab_n_tokens(impl_->vocab);
-    if (n <= 0 || out_capacity < n) return 0;
-
-    // -1 is the most recent decode's logits row, which is what the caller wants to inspect
-    // before choosing the next token. Null means no live logits (e.g. nothing decoded yet).
-    const float* logits = llama_get_logits_ith(impl_->shared_ctx, -1);
-    if (!logits) return 0;
-
-    std::memcpy(out, logits, static_cast<size_t>(n) * sizeof(float));
-    return n;
-}
-
-EngineStatus CotabbyInferenceEngine::acceptToken(int32_t sequence_id, int32_t token) {
-    if (!impl_ || !impl_->model || !impl_->shared_ctx) return EngineStatus::not_loaded;
-
-    SequenceState* seq = impl_->findSequence(sequence_id);
-    if (!seq) return EngineStatus::error;
-
-    if (seq->cancelled.load(std::memory_order_acquire)) {
-        return EngineStatus::cancelled;
-    }
-
-    // Feed the chosen token to the sampler so repetition/penalty state matches what sampleNext
-    // would have produced; the caller selected the token externally but the sampler must still see it.
-    llama_sampler_accept(seq->sampler, token);
-
-    // Serialize with the decoder thread so this manual decode never races an in-flight batch.
-    std::lock_guard<std::mutex> lock(impl_->decode_mutex);
-
-    // Single-token feedback decode, mirroring the KV-advancing step in sampleNext/processBatch:
-    // pos = current KV position, request logits so a fresh row is ready for getNextTokenLogits.
-    llama_batch batch = llama_batch_init(1, 0, 1);
-    batch.n_tokens = 1;
-    batch.token[0] = token;
-    batch.pos[0] = static_cast<llama_pos>(seq->kv_position_count);
-    batch.n_seq_id[0] = 1;
-    if (batch.seq_id && batch.seq_id[0]) {
-        batch.seq_id[0][0] = seq->seq_id;
-    }
-    batch.logits[0] = 1;
-
-    int status = llama_decode(impl_->shared_ctx, batch);
-    llama_batch_free(batch);
-
-    if (status != 0) {
-        return EngineStatus::error;
-    }
-
-    seq->kv_position_count++;
-    return EngineStatus::ok;
-}
-
-// ---------------------------------------------------------------------------
 // KV cache management
 // ---------------------------------------------------------------------------
 
@@ -1221,13 +793,12 @@ bool CotabbyInferenceEngine::trimKV(int32_t sequence_id, int keep_positions) {
     llama_memory_t memory = llama_get_memory(impl_->shared_ctx);
     if (!memory) return false;
 
-    // Serialize with the decoder thread; we don't want to remove KV slots
-    // mid-batch.
+    // Serialize with prompt and feedback decode; never remove KV while llama is mutating it.
     std::lock_guard<std::mutex> lock(impl_->decode_mutex);
 
     bool ok = llama_memory_seq_rm(
         memory,
-        seq->seq_id,
+        Impl::SEQUENCE_ID,
         static_cast<llama_pos>(keep_positions),
         -1
     );
@@ -1241,11 +812,6 @@ bool CotabbyInferenceEngine::trimKV(int32_t sequence_id, int keep_positions) {
         seq->has_pending_input = false;
     }
     return ok;
-}
-
-int CotabbyInferenceEngine::getKVPositionCount(int32_t sequence_id) const {
-    const SequenceState* seq = impl_->findSequence(sequence_id);
-    return seq ? seq->kv_position_count : 0;
 }
 
 void CotabbyInferenceEngine::setForceWordContinuation(int32_t sequence_id, bool enabled) {
@@ -1262,46 +828,6 @@ void CotabbyInferenceEngine::setComputeLogprob(int32_t sequence_id, bool enabled
     if (seq) {
         seq->compute_logprob = enabled;
     }
-}
-
-// ---------------------------------------------------------------------------
-// KV state snapshot / restore
-//
-// Thin wrappers over llama's single-sequence state copy. They serialize with the decoder thread
-// via decode_mutex so a snapshot or restore never races an in-flight llama_decode. Callers pair a
-// snapshot with the KV position count they observed and pass it back on restore, so this engine's
-// own position bookkeeping stays consistent with the restored KV cache.
-// ---------------------------------------------------------------------------
-
-size_t CotabbyInferenceEngine::snapshotSize(int32_t sequence_id) const {
-    if (!impl_ || !impl_->shared_ctx) return 0;
-    const SequenceState* seq = impl_->findSequence(sequence_id);
-    if (!seq) return 0;
-    return llama_state_seq_get_size(impl_->shared_ctx, seq->seq_id);
-}
-
-size_t CotabbyInferenceEngine::snapshotSequence(int32_t sequence_id, uint8_t* dst, size_t capacity) {
-    if (!impl_ || !impl_->shared_ctx || !dst) return 0;
-    SequenceState* seq = impl_->findSequence(sequence_id);
-    if (!seq) return 0;
-    std::lock_guard<std::mutex> lock(impl_->decode_mutex);
-    return llama_state_seq_get_data(impl_->shared_ctx, dst, capacity, seq->seq_id);
-}
-
-bool CotabbyInferenceEngine::restoreSequence(int32_t sequence_id, const uint8_t* src,
-                                             size_t size, int position_count) {
-    if (!impl_ || !impl_->shared_ctx || !src) return false;
-    SequenceState* seq = impl_->findSequence(sequence_id);
-    if (!seq) return false;
-    std::lock_guard<std::mutex> lock(impl_->decode_mutex);
-    const size_t read = llama_state_seq_set_data(impl_->shared_ctx, src, size, seq->seq_id);
-    if (read == 0) return false;
-    seq->kv_position_count = position_count;
-    // The restored blob invalidates any seed/pending token captured before; force the caller to
-    // re-prime via decodePrompt before the next sampleNext.
-    seq->has_seed_token = false;
-    seq->has_pending_input = false;
-    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1333,8 +859,4 @@ int CotabbyInferenceEngine::getThreadCount() const {
 
 int CotabbyInferenceEngine::getGPULayerCount() const {
     return impl_->gpu_layer_count;
-}
-
-int CotabbyInferenceEngine::getMaskedScaffoldingTokenCount() const {
-    return impl_->scaffolding_masked_count;
 }
