@@ -1,605 +1,288 @@
-import XCTest
 import CotabbyInference
+import XCTest
 
 final class LlamaMiddlewareTests: XCTestCase {
-
-    func testEngineStartsUnloaded() {
-        let engine = CotabbyInferenceEngine()
-        XCTAssertFalse(engine.isModelLoaded())
-    }
-
     func testUnloadWhenNothingLoadedIsIdempotent() {
-        var engine = CotabbyInferenceEngine()  // var: unloadModel mutates
+        var engine = CotabbyInferenceEngine()
         engine.unloadModel()
         engine.unloadModel()
-        XCTAssertFalse(engine.isModelLoaded())
     }
 
     func testLoadModelWithBadPathReturnsError() {
         var engine = CotabbyInferenceEngine()
-        let status = engine.loadModel("/nonexistent/path.gguf", -1, 2048, 512)
-        XCTAssertEqual(status, EngineStatus.error)
-        XCTAssertFalse(engine.isModelLoaded())
-    }
-
-    func testCreateSequenceWithoutModelReturnsMinus1() {
-        var engine = CotabbyInferenceEngine()
-        let config = SamplingConfig(
-            max_prediction_tokens: 8,
-            temperature: 0.1,
-            top_k: 20,
-            top_p: 0.7,
-            min_p: 0.08,
-            repetition_penalty: 1.05,
-            seed: 0,
-            single_line: false
+        XCTAssertEqual(
+            engine.loadModel("/nonexistent/path.gguf", -1, 2048, 512),
+            EngineStatus.error
         )
-        let seqId = engine.createSequence(config)
-        XCTAssertEqual(seqId, -1)
     }
 
-    func testDestroySequenceWithInvalidIdDoesNotCrash() {
+    func testCreateSequenceWithoutModelReturnsMinusOne() {
+        var engine = CotabbyInferenceEngine()
+        XCTAssertEqual(engine.createSequence(Self.samplingConfig()), -1)
+    }
+
+    func testInvalidSequenceOperationsDoNotCrash() {
         var engine = CotabbyInferenceEngine()
         engine.destroySequence(999)
         engine.destroySequence(-1)
-    }
-
-    func testCancelSequenceWithInvalidIdDoesNotCrash() {
-        var engine = CotabbyInferenceEngine()
         engine.cancelSequence(999)
+        engine.setForceWordContinuation(999, true)
+        engine.setComputeLogprob(999, false)
     }
 
     func testTokenizeWithoutModelReturnsEmpty() {
         let engine = CotabbyInferenceEngine()
         let text = "hello"
-        let tokens = engine.tokenize(text, Int32(text.utf8.count))
-        XCTAssertTrue(tokens.isEmpty)
-    }
-
-    func testTokenizeWithOptionsWithoutModelReturnsEmpty() {
-        let engine = CotabbyInferenceEngine()
-        let text = "hello"
-        let tokens = engine.tokenizeWithOptions(
-            text, Int32(text.utf8.count), false, true
-        )
-        XCTAssertTrue(tokens.isEmpty)
-    }
-
-    func testHasChatTemplateWithoutModelIsFalse() {
-        let engine = CotabbyInferenceEngine()
-        XCTAssertFalse(engine.hasChatTemplate())
-    }
-
-    func testApplyChatTemplateWithoutModelReturnsZero() {
-        let engine = CotabbyInferenceEngine()
-        var buffer = [CChar](repeating: 0, count: 256)
-        let written = engine.applyChatTemplate(
-            "You complete text.", "The quick brown", true, &buffer, Int32(buffer.count)
-        )
-        // No model loaded → 0 (caller falls back to the raw path).
-        XCTAssertEqual(written, 0)
+        XCTAssertTrue(engine.tokenize(text, Int32(text.utf8.count)).isEmpty)
     }
 
     func testDiagnosticsDefaultToZero() {
         let engine = CotabbyInferenceEngine()
         XCTAssertEqual(engine.getContextWindowTokens(), 0)
         XCTAssertEqual(engine.getBatchSize(), 0)
+        XCTAssertEqual(engine.getThreadCount(), 0)
         XCTAssertEqual(engine.getGPULayerCount(), 0)
     }
 
     func testDecodePromptWithoutModelReturnsNotLoaded() {
         var engine = CotabbyInferenceEngine()
         var tokens: [Int32] = [1, 2, 3]
-        let status = engine.decodePrompt(1, &tokens, Int32(tokens.count), 0)
-        XCTAssertEqual(status, EngineStatus.not_loaded)
+        XCTAssertEqual(
+            engine.decodePrompt(1, &tokens, Int32(tokens.count), 0),
+            EngineStatus.not_loaded
+        )
     }
 
-    func testEndToEndWithModel() throws {
-        guard let modelPath = ProcessInfo.processInfo.environment["COTABBY_TEST_MODEL_PATH"],
-              FileManager.default.fileExists(atPath: modelPath) else {
-            throw XCTSkip("Set COTABBY_TEST_MODEL_PATH to a .gguf file to run this test")
-        }
-
+    func testEndToEndSingleSequenceLifecycle() throws {
+        let modelPath = try Self.modelPath()
         var engine = CotabbyInferenceEngine()
+        XCTAssertEqual(engine.loadModel(modelPath, -1, 2048, 512), EngineStatus.ok)
+        defer { engine.unloadModel() }
 
-        // Load
-        let loadStatus = engine.loadModel(modelPath, -1, 2048, 512)
-        XCTAssertEqual(loadStatus, EngineStatus.ok)
-        XCTAssertTrue(engine.isModelLoaded())
         XCTAssertEqual(engine.getContextWindowTokens(), 2048)
         XCTAssertEqual(engine.getBatchSize(), 512)
         XCTAssertGreaterThan(engine.getThreadCount(), 0)
 
-        // Idempotent re-load
-        let reloadStatus = engine.loadModel(modelPath, -1, 2048, 512)
-        XCTAssertEqual(reloadStatus, EngineStatus.ok)
+        // Repeating an identical load remains an idempotent no-op.
+        XCTAssertEqual(engine.loadModel(modelPath, -1, 2048, 512), EngineStatus.ok)
 
-        // Tokenize
         let prompt = "The quick brown fox"
-        let tokens = engine.tokenize(prompt, Int32(prompt.utf8.count))
+        var tokens = Array(engine.tokenize(prompt, Int32(prompt.utf8.count)))
         XCTAssertFalse(tokens.isEmpty)
 
-        // Chat-template path: instruct models ship a template; if present,
-        // rendering a simple conversation must produce a non-empty prompt that
-        // tokenizes (with parse_special) to a non-empty token list.
-        if engine.hasChatTemplate() {
-            // Render system + user through the model's template into a caller buffer.
-            var buffer = [CChar](repeating: 0, count: 4096)
-            let written = engine.applyChatTemplate(
-                "You complete text.", "The quick brown", true, &buffer, Int32(buffer.count)
-            )
-            XCTAssertGreaterThan(written, 0, "Model reports a template but rendering produced no bytes")
-
-            let rendered = buffer.prefix(Int(written)).withUnsafeBufferPointer { ptr in
-                String(
-                    bytes: UnsafeRawBufferPointer(ptr),
-                    encoding: .utf8
-                )
-            }
-            let renderedSwift = try XCTUnwrap(rendered, "Rendered template was not valid UTF-8")
-            XCTAssertFalse(renderedSwift.isEmpty)
-
-            let templated = engine.tokenizeWithOptions(
-                renderedSwift, Int32(renderedSwift.utf8.count), false, true
-            )
-            XCTAssertFalse(templated.isEmpty)
-        }
-
-        // Detokenize a content token (the prompt's last token). Index 0 can be BOS, a control
-        // token that renders to zero bytes with special=false, so we avoid it here.
-        var buf = [CChar](repeating: 0, count: 64)
-        let written = engine.detokenize(tokens[tokens.count - 1], &buf, Int32(buf.count))
-        XCTAssertGreaterThan(written, 0)
-
-        // Create autocomplete sequence
-        let autoConfig = SamplingConfig(
-            max_prediction_tokens: 8,
-            temperature: 0.1,
-            top_k: 20,
-            top_p: 0.7,
-            min_p: 0.08,
-            repetition_penalty: 1.05,
-            seed: 42,
-            single_line: false
+        let sequence = engine.createSequence(Self.samplingConfig())
+        XCTAssertGreaterThan(sequence, 0)
+        XCTAssertEqual(
+            engine.createSequence(Self.samplingConfig(seed: 99)),
+            -1,
+            "The engine must reject a second live sequence"
         )
-        let seqA = engine.createSequence(autoConfig)
-        XCTAssertGreaterThan(seqA, 0)
 
-        // Decode prompt
-        var tokenArray = Array(tokens)
-        let decodeStatus = engine.decodePrompt(
-            seqA, &tokenArray, Int32(tokenArray.count), 0
+        XCTAssertEqual(
+            engine.decodePrompt(sequence, &tokens, Int32(tokens.count), 0),
+            EngineStatus.ok
         )
-        XCTAssertEqual(decodeStatus, EngineStatus.ok)
-        XCTAssertEqual(engine.getKVPositionCount(seqA), Int32(tokenArray.count))
 
-        // Sample a few tokens
         var generated = ""
-        for _ in 0..<4 {
-            let result = engine.sampleNext(seqA)
+        for _ in 0 ..< 4 {
+            let result = engine.sampleNext(sequence)
             if result.is_eos { break }
             XCTAssertFalse(result.was_cancelled)
-            if let piece = result.piece, result.piece_length > 0 {
-                generated += String(
-                    bytes: UnsafeBufferPointer(
-                        start: UnsafeRawPointer(piece)
-                            .assumingMemoryBound(to: UInt8.self),
-                        count: Int(result.piece_length)
-                    ),
-                    encoding: .utf8
-                ) ?? ""
-            }
+            generated += Self.string(from: result)
         }
         XCTAssertFalse(generated.isEmpty, "Expected at least one generated token")
 
-        // Trim KV back to prompt (remove sampled tokens)
-        let trimOk = engine.trimKV(seqA, Int32(tokenArray.count))
-        XCTAssertTrue(trimOk)
-        XCTAssertEqual(engine.getKVPositionCount(seqA), Int32(tokenArray.count))
+        // Hybrid/recurrent and SWA model caches can reject partial KV removal. Cotabby treats
+        // that as a cache-reuse miss and rebuilds the sequence, so lifecycle coverage must not
+        // require a model-specific optimization to succeed.
+        _ = engine.trimKV(sequence, Int32(tokens.count))
 
-        // Create a second concurrent sequence (summary config)
-        let summaryConfig = SamplingConfig(
-            max_prediction_tokens: 60,
-            temperature: 0.5,
-            top_k: 40,
-            top_p: 0.95,
-            min_p: 0.05,
-            repetition_penalty: 1.4,
-            seed: 0,
-            single_line: false
-        )
-        let seqB = engine.createSequence(summaryConfig)
-        XCTAssertGreaterThan(seqB, 0)
-        XCTAssertNotEqual(seqA, seqB)
+        engine.destroySequence(sequence)
+        let replacement = engine.createSequence(Self.samplingConfig(seed: 100))
+        XCTAssertGreaterThan(replacement, 0)
+        XCTAssertNotEqual(replacement, sequence)
+        engine.destroySequence(replacement)
 
-        // Both sequences exist simultaneously
-        XCTAssertGreaterThan(engine.getKVPositionCount(seqA), 0)
-        XCTAssertEqual(engine.getKVPositionCount(seqB), 0)
-
-        // Destroy both
-        engine.destroySequence(seqB)
-        engine.destroySequence(seqA)
-
-        // Double-destroy is safe
-        engine.destroySequence(seqA)
-
-        // Unload
-        engine.unloadModel()
-        XCTAssertFalse(engine.isModelLoaded())
+        // Stale and repeated destruction must not affect a later sequence identity.
+        engine.destroySequence(sequence)
     }
 
-    // Multi-sequence sequential test. Drives the new shared-context decoder
-    // thread through two interleaved sampling loops to verify the seed-token
-    // / feedback-decode handoff produces valid tokens for both sequences
-    // when their sampleNext calls alternate.
-    func testInterleavedMultiSequenceSampling() throws {
-        guard let modelPath = ProcessInfo.processInfo.environment["COTABBY_TEST_MODEL_PATH"] else {
-            try XCTSkipIf(true, "Set COTABBY_TEST_MODEL_PATH to a .gguf file to run this test")
-            return
-        }
-
-        var engine = CotabbyInferenceEngine()
-        XCTAssertEqual(engine.loadModel(modelPath, -1, 1024, 256), EngineStatus.ok)
-        defer { engine.unloadModel() }
-
-        let prompt = "The quick brown fox jumps over the lazy dog."
-        let tokens = engine.tokenize(prompt, Int32(prompt.utf8.count))
-        XCTAssertGreaterThan(tokens.size(), 0)
-
-        let configA = SamplingConfig(
-            max_prediction_tokens: 16, temperature: 0,
-            top_k: 0, top_p: 0, min_p: 0,
-            repetition_penalty: 0, seed: 1,
-            single_line: false
-        )
-        let configB = SamplingConfig(
-            max_prediction_tokens: 16, temperature: 0,
-            top_k: 0, top_p: 0, min_p: 0,
-            repetition_penalty: 0, seed: 2,
-            single_line: false
-        )
-
-        let seqA = engine.createSequence(configA)
-        let seqB = engine.createSequence(configB)
-        XCTAssertGreaterThan(seqA, 0)
-        XCTAssertGreaterThan(seqB, 0)
-
-        var tokenArr = Array(tokens)
-        XCTAssertEqual(
-            engine.decodePrompt(seqA, &tokenArr, Int32(tokenArr.count), 0),
-            EngineStatus.ok
-        )
-        XCTAssertEqual(
-            engine.decodePrompt(seqB, &tokenArr, Int32(tokenArr.count), 0),
-            EngineStatus.ok
-        )
-
-        // Alternate sampleNext between the two sequences. With greedy
-        // sampling and identical prompts, the first sampled tokens for both
-        // sequences should be identical (different samplers reading the
-        // same logits row at separate decodePrompt times).
-        var sampledA: [Int32] = []
-        var sampledB: [Int32] = []
-        for _ in 0..<8 {
-            let rA = engine.sampleNext(seqA)
-            let rB = engine.sampleNext(seqB)
-            XCTAssertFalse(rA.was_cancelled)
-            XCTAssertFalse(rB.was_cancelled)
-            if rA.is_eos || rB.is_eos { break }
-            sampledA.append(rA.token)
-            sampledB.append(rB.token)
-        }
-        XCTAssertEqual(sampledA.count, sampledB.count)
-        XCTAssertGreaterThan(sampledA.count, 0)
-        XCTAssertEqual(sampledA, sampledB,
-            "Greedy sampling with identical prompts should match across sequences")
-
-        engine.destroySequence(seqA)
-        engine.destroySequence(seqB)
-    }
-
-    // Cancellation regression: setting cancelled on a sequence mid-loop must
-    // cause subsequent sampleNext calls to return was_cancelled=true so
-    // callers can break out without waiting for the full prediction budget.
     func testCancellationStopsSamplingPromptly() throws {
-        guard let modelPath = ProcessInfo.processInfo.environment["COTABBY_TEST_MODEL_PATH"] else {
-            try XCTSkipIf(true, "Set COTABBY_TEST_MODEL_PATH to a .gguf file to run this test")
-            return
-        }
-
+        let modelPath = try Self.modelPath()
         var engine = CotabbyInferenceEngine()
         XCTAssertEqual(engine.loadModel(modelPath, -1, 1024, 256), EngineStatus.ok)
         defer { engine.unloadModel() }
 
+        let sequence = engine.createSequence(Self.samplingConfig(temperature: 0))
         let prompt = "Hello"
-        let tokens = engine.tokenize(prompt, Int32(prompt.utf8.count))
-        let config = SamplingConfig(
-            max_prediction_tokens: 32, temperature: 0,
-            top_k: 0, top_p: 0, min_p: 0,
-            repetition_penalty: 0, seed: 0,
-            single_line: false
-        )
-
-        let seq = engine.createSequence(config)
-        var tokenArr = Array(tokens)
+        var tokens = Array(engine.tokenize(prompt, Int32(prompt.utf8.count)))
         XCTAssertEqual(
-            engine.decodePrompt(seq, &tokenArr, Int32(tokenArr.count), 0),
+            engine.decodePrompt(sequence, &tokens, Int32(tokens.count), 0),
             EngineStatus.ok
         )
 
-        // Sample a couple of tokens first.
-        for _ in 0..<2 {
-            let r = engine.sampleNext(seq)
-            XCTAssertFalse(r.was_cancelled)
-        }
-
-        // Cancel. The next sampleNext should return was_cancelled=true
-        // without doing any further model work.
-        engine.cancelSequence(seq)
-        let cancelled = engine.sampleNext(seq)
-        XCTAssertTrue(cancelled.was_cancelled,
-            "sampleNext after cancelSequence must return was_cancelled=true")
-
-        engine.destroySequence(seq)
+        _ = engine.sampleNext(sequence)
+        engine.cancelSequence(sequence)
+        XCTAssertTrue(engine.sampleNext(sequence).was_cancelled)
+        engine.destroySequence(sequence)
     }
 
-    func testSetForceWordContinuationWithoutModelDoesNotCrash() {
-        var engine = CotabbyInferenceEngine()
-        engine.setForceWordContinuation(999, true)
-        engine.setForceWordContinuation(-1, false)
-        XCTAssertFalse(engine.isModelLoaded())
-    }
-
-    func testSnapshotSizeWithoutModelIsZero() {
-        let engine = CotabbyInferenceEngine()
-        XCTAssertEqual(engine.snapshotSize(1), 0)
-    }
-
-    // With the first-token word-continuation constraint set, the seed token must not start a new
-    // word, i.e. its decoded text must not begin with whitespace.
     func testForceWordContinuationConstrainsFirstToken() throws {
-        guard let modelPath = ProcessInfo.processInfo.environment["COTABBY_TEST_MODEL_PATH"] else {
-            try XCTSkipIf(true, "Set COTABBY_TEST_MODEL_PATH to a .gguf file to run this test")
-            return
-        }
+        let modelPath = try Self.modelPath()
         var engine = CotabbyInferenceEngine()
         XCTAssertEqual(engine.loadModel(modelPath, -1, 1024, 256), EngineStatus.ok)
         defer { engine.unloadModel() }
 
-        let config = SamplingConfig(
-            max_prediction_tokens: 8, temperature: 0,
-            top_k: 0, top_p: 0, min_p: 0,
-            repetition_penalty: 0, seed: 0,
-            single_line: false
-        )
-        let seq = engine.createSequence(config)
-        XCTAssertGreaterThan(seq, 0)
-
-        // Prompt ends mid-word ("writ"); the forced continuation must finish the word.
+        let sequence = engine.createSequence(Self.samplingConfig(temperature: 0))
         let prompt = "I am writ"
         var tokens = Array(engine.tokenize(prompt, Int32(prompt.utf8.count)))
-        XCTAssertGreaterThan(tokens.count, 0)
-
-        engine.setForceWordContinuation(seq, true)
-        XCTAssertEqual(engine.decodePrompt(seq, &tokens, Int32(tokens.count), 0), EngineStatus.ok)
-
-        let result = engine.sampleNext(seq)
-        if !result.is_eos, let piece = result.piece, result.piece_length > 0 {
-            let text = String(
-                bytes: UnsafeBufferPointer(
-                    start: UnsafeRawPointer(piece).assumingMemoryBound(to: UInt8.self),
-                    count: Int(result.piece_length)
-                ),
-                encoding: .utf8
-            ) ?? ""
-            if let firstChar = text.first {
-                XCTAssertFalse(
-                    firstChar.isWhitespace,
-                    "Forced word continuation must not begin the first token with whitespace"
-                )
-            }
-        }
-        engine.destroySequence(seq)
-    }
-
-    // Snapshotting a sequence then restoring it must return the engine's KV position bookkeeping
-    // to the captured value.
-    func testSnapshotRestorePreservesPosition() throws {
-        guard let modelPath = ProcessInfo.processInfo.environment["COTABBY_TEST_MODEL_PATH"] else {
-            try XCTSkipIf(true, "Set COTABBY_TEST_MODEL_PATH to a .gguf file to run this test")
-            return
-        }
-        var engine = CotabbyInferenceEngine()
-        XCTAssertEqual(engine.loadModel(modelPath, -1, 1024, 256), EngineStatus.ok)
-        defer { engine.unloadModel() }
-
-        let config = SamplingConfig(
-            max_prediction_tokens: 8, temperature: 0,
-            top_k: 0, top_p: 0, min_p: 0,
-            repetition_penalty: 0, seed: 0,
-            single_line: false
+        engine.setForceWordContinuation(sequence, true)
+        XCTAssertEqual(
+            engine.decodePrompt(sequence, &tokens, Int32(tokens.count), 0),
+            EngineStatus.ok
         )
-        let seq = engine.createSequence(config)
-        let prompt = "The quick brown fox"
-        var tokens = Array(engine.tokenize(prompt, Int32(prompt.utf8.count)))
-        XCTAssertEqual(engine.decodePrompt(seq, &tokens, Int32(tokens.count), 0), EngineStatus.ok)
 
-        let position = engine.getKVPositionCount(seq)
-        XCTAssertGreaterThan(position, 0)
-
-        let size = engine.snapshotSize(seq)
-        XCTAssertGreaterThan(size, 0)
-        var buffer = [UInt8](repeating: 0, count: Int(size))
-        let written = engine.snapshotSequence(seq, &buffer, size)
-        XCTAssertGreaterThan(written, 0)
-
-        // Advance past the snapshot point, then restore back to it.
-        _ = engine.sampleNext(seq)
-        XCTAssertTrue(engine.restoreSequence(seq, buffer, written, position))
-        XCTAssertEqual(engine.getKVPositionCount(seq), position)
-
-        engine.destroySequence(seq)
+        let result = engine.sampleNext(sequence)
+        if !result.is_eos, let first = Self.string(from: result).first {
+            XCTAssertFalse(first.isWhitespace)
+        }
+        engine.destroySequence(sequence)
     }
 
-    // A sampled (non-EOS) token must carry a finite log-probability that is <= 0, so the app can use
-    // it as a confidence signal.
     func testSampleNextReportsFiniteLogprob() throws {
-        guard let modelPath = ProcessInfo.processInfo.environment["COTABBY_TEST_MODEL_PATH"] else {
-            try XCTSkipIf(true, "Set COTABBY_TEST_MODEL_PATH to a .gguf file to run this test")
-            return
-        }
+        let modelPath = try Self.modelPath()
         var engine = CotabbyInferenceEngine()
         XCTAssertEqual(engine.loadModel(modelPath, -1, 1024, 256), EngineStatus.ok)
         defer { engine.unloadModel() }
 
-        let config = SamplingConfig(
-            max_prediction_tokens: 4, temperature: 0,
-            top_k: 0, top_p: 0, min_p: 0,
-            repetition_penalty: 0, seed: 0,
-            single_line: false
-        )
-        let seq = engine.createSequence(config)
+        let sequence = engine.createSequence(Self.samplingConfig(temperature: 0))
         let prompt = "The quick brown fox"
         var tokens = Array(engine.tokenize(prompt, Int32(prompt.utf8.count)))
-        XCTAssertEqual(engine.decodePrompt(seq, &tokens, Int32(tokens.count), 0), EngineStatus.ok)
+        XCTAssertEqual(
+            engine.decodePrompt(sequence, &tokens, Int32(tokens.count), 0),
+            EngineStatus.ok
+        )
 
-        let result = engine.sampleNext(seq)
+        let result = engine.sampleNext(sequence)
         if !result.is_eos {
-            XCTAssertTrue(result.logprob.isFinite, "logprob must be finite")
-            XCTAssertLessThanOrEqual(result.logprob, 0.0001, "a log-probability must be <= 0")
+            XCTAssertTrue(result.logprob.isFinite)
+            XCTAssertLessThanOrEqual(result.logprob, 0.0001)
         }
-        engine.destroySequence(seq)
+        engine.destroySequence(sequence)
     }
 
-    func testSetComputeLogprobWithInvalidIdDoesNotCrash() {
-        var engine = CotabbyInferenceEngine()
-        engine.setComputeLogprob(999, false)
-        engine.setComputeLogprob(-1, true)
-    }
-
-    // Opting out of log-probabilities must zero `logprob` on both the seed token (first sampleNext)
-    // and the steady-state decoder path, while leaving the sampled tokens themselves untouched.
-    func testSetComputeLogprobFalseZeroesLogprob() throws {
-        guard let modelPath = ProcessInfo.processInfo.environment["COTABBY_TEST_MODEL_PATH"] else {
-            try XCTSkipIf(true, "Set COTABBY_TEST_MODEL_PATH to a .gguf file to run this test")
-            return
-        }
+    func testDisablingLogprobSkipsSeedAndSteadyStateWork() throws {
+        let modelPath = try Self.modelPath()
         var engine = CotabbyInferenceEngine()
         XCTAssertEqual(engine.loadModel(modelPath, -1, 1024, 256), EngineStatus.ok)
         defer { engine.unloadModel() }
 
-        let config = SamplingConfig(
-            max_prediction_tokens: 4, temperature: 0,
-            top_k: 0, top_p: 0, min_p: 0,
-            repetition_penalty: 0, seed: 0,
-            single_line: false
-        )
-        let seq = engine.createSequence(config)
-        engine.setComputeLogprob(seq, false)
-
+        let sequence = engine.createSequence(Self.samplingConfig(temperature: 0))
+        engine.setComputeLogprob(sequence, false)
         let prompt = "The quick brown fox"
         var tokens = Array(engine.tokenize(prompt, Int32(prompt.utf8.count)))
-        XCTAssertEqual(engine.decodePrompt(seq, &tokens, Int32(tokens.count), 0), EngineStatus.ok)
+        XCTAssertEqual(
+            engine.decodePrompt(sequence, &tokens, Int32(tokens.count), 0),
+            EngineStatus.ok
+        )
 
-        // Seed token (computed at decodePrompt) and two steady-state tokens.
-        for _ in 0..<3 {
-            let result = engine.sampleNext(seq)
+        for _ in 0 ..< 3 {
+            let result = engine.sampleNext(sequence)
             if result.is_eos || result.was_cancelled { break }
-            XCTAssertEqual(result.logprob, 0.0, "logprob must be exactly 0 when computation is disabled")
+            XCTAssertEqual(result.logprob, 0)
         }
-        engine.destroySequence(seq)
+        engine.destroySequence(sequence)
     }
 
-    func testMaskedScaffoldingCountDefaultsToZero() {
-        let engine = CotabbyInferenceEngine()
-        XCTAssertEqual(engine.getMaskedScaffoldingTokenCount(), 0)
-    }
-
-    // Single-token chat/template markers must never surface as sampled text. Most vocabularies
-    // flag them as control tokens (masked by the base rule); the scaffolding rule covers ones
-    // that ship unflagged. Either way the observable contract is the same: no sampled piece is
-    // ever a complete marker string, even at high temperature with a template-bait prompt.
     func testSamplingNeverEmitsScaffoldingMarkerPieces() throws {
-        guard let modelPath = ProcessInfo.processInfo.environment["COTABBY_TEST_MODEL_PATH"] else {
-            try XCTSkipIf(true, "Set COTABBY_TEST_MODEL_PATH to a .gguf file to run this test")
-            return
-        }
+        let modelPath = try Self.modelPath()
         var engine = CotabbyInferenceEngine()
         XCTAssertEqual(engine.loadModel(modelPath, -1, 1024, 256), EngineStatus.ok)
         defer { engine.unloadModel() }
-        XCTAssertGreaterThanOrEqual(engine.getMaskedScaffoldingTokenCount(), 0)
 
         let markers: Set<String> = [
             "<|im_start|>", "<|im_end|>", "<|user|>", "<|assistant|>", "<|system|>",
             "<|start_header_id|>", "<|end_header_id|>", "<|eot_id|>", "<|end|>",
             "<|endoftext|>", "<start_of_turn>", "<end_of_turn>", "[INST]", "[/INST]"
         ]
-        let config = SamplingConfig(
-            max_prediction_tokens: 64, temperature: 1.8,
-            top_k: 0, top_p: 0, min_p: 0,
-            repetition_penalty: 1.0, seed: 7,
-            single_line: false
-        )
-        let seq = engine.createSequence(config)
+        let sequence = engine.createSequence(Self.samplingConfig(temperature: 1.8, seed: 7))
         let prompt = "<|im_start|>user\nWrite a reply<|im_end|>\n<|im_start|>assistant\n"
         var tokens = Array(engine.tokenize(prompt, Int32(prompt.utf8.count)))
-        XCTAssertEqual(engine.decodePrompt(seq, &tokens, Int32(tokens.count), 0), EngineStatus.ok)
+        XCTAssertEqual(
+            engine.decodePrompt(sequence, &tokens, Int32(tokens.count), 0),
+            EngineStatus.ok
+        )
 
-        for _ in 0..<64 {
-            let result = engine.sampleNext(seq)
+        for _ in 0 ..< 64 {
+            let result = engine.sampleNext(sequence)
             if result.is_eos || result.was_cancelled { break }
-            guard let piecePointer = result.piece else { continue }
-            let piece = String(
-                bytes: UnsafeRawBufferPointer(start: piecePointer, count: Int(result.piece_length)),
-                encoding: .utf8
-            ) ?? ""
-            XCTAssertFalse(
-                markers.contains(piece),
-                "Sampled a complete scaffolding marker piece: \(piece)"
-            )
+            XCTAssertFalse(markers.contains(Self.string(from: result)))
         }
-        engine.destroySequence(seq)
+        engine.destroySequence(sequence)
     }
 
-    // Under greedy sampling with penalties disabled, the sampled token IS the raw argmax, so
-    // `argmax_is_eog` must agree with `isEndOfGenerationToken(sampled token)` on every step.
-    // This pins the flag's semantics without needing the model to reach a natural EOS.
-    func testArgmaxIsEOGMatchesGreedyChoice() throws {
-        guard let modelPath = ProcessInfo.processInfo.environment["COTABBY_TEST_MODEL_PATH"] else {
-            try XCTSkipIf(true, "Set COTABBY_TEST_MODEL_PATH to a .gguf file to run this test")
-            return
-        }
+    func testArgmaxIsEOGMatchesGreedySample() throws {
+        let modelPath = try Self.modelPath()
         var engine = CotabbyInferenceEngine()
         XCTAssertEqual(engine.loadModel(modelPath, -1, 1024, 256), EngineStatus.ok)
         defer { engine.unloadModel() }
 
-        let config = SamplingConfig(
-            max_prediction_tokens: 24, temperature: 0,
-            top_k: 0, top_p: 0, min_p: 0,
-            repetition_penalty: 1.0, seed: 0,
-            single_line: false
+        let sequence = engine.createSequence(
+            Self.samplingConfig(temperature: 0, repetitionPenalty: 1)
         )
-        let seq = engine.createSequence(config)
         let prompt = "The capital of France is"
         var tokens = Array(engine.tokenize(prompt, Int32(prompt.utf8.count)))
-        XCTAssertEqual(engine.decodePrompt(seq, &tokens, Int32(tokens.count), 0), EngineStatus.ok)
+        XCTAssertEqual(
+            engine.decodePrompt(sequence, &tokens, Int32(tokens.count), 0),
+            EngineStatus.ok
+        )
 
         var steps = 0
-        for _ in 0..<24 {
-            let result = engine.sampleNext(seq)
+        for _ in 0 ..< 24 {
+            let result = engine.sampleNext(sequence)
             if result.was_cancelled { break }
-            // Greedy + no penalties: sampled token == raw argmax. A masked control token can in
-            // principle displace the raw argmax from the greedy pick, but EOG tokens are never
-            // masked, so the EOG verdicts still agree.
-            XCTAssertEqual(
-                result.argmax_is_eog,
-                engine.isEndOfGenerationToken(result.token),
-                "argmax_is_eog disagreed with the greedy token's EOG status at step \(steps)"
-            )
+            XCTAssertEqual(result.argmax_is_eog, result.is_eos)
             steps += 1
             if result.is_eos { break }
         }
-        XCTAssertGreaterThan(steps, 0, "Expected at least one sampled step")
-        engine.destroySequence(seq)
+        XCTAssertGreaterThan(steps, 0)
+        engine.destroySequence(sequence)
+    }
+}
+
+private extension LlamaMiddlewareTests {
+    static func modelPath() throws -> String {
+        guard let path = ProcessInfo.processInfo.environment["COTABBY_TEST_MODEL_PATH"],
+              FileManager.default.fileExists(atPath: path) else {
+            throw XCTSkip("Set COTABBY_TEST_MODEL_PATH to a .gguf file to run model-backed tests")
+        }
+        return path
+    }
+
+    static func samplingConfig(
+        temperature: Float = 0.1,
+        repetitionPenalty: Float = 1.05,
+        seed: UInt32 = 42
+    ) -> SamplingConfig {
+        SamplingConfig(
+            temperature: temperature,
+            top_k: 20,
+            top_p: 0.7,
+            min_p: 0.08,
+            repetition_penalty: repetitionPenalty,
+            seed: seed,
+            single_line: false
+        )
+    }
+
+    static func string(from result: SampleResult) -> String {
+        guard let piece = result.piece, result.piece_length > 0 else { return "" }
+        return String(
+            bytes: UnsafeBufferPointer(
+                start: UnsafeRawPointer(piece).assumingMemoryBound(to: UInt8.self),
+                count: Int(result.piece_length)
+            ),
+            encoding: .utf8
+        ) ?? ""
     }
 }

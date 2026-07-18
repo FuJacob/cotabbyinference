@@ -1,30 +1,41 @@
-<!-- ROCKETRIDE:BEGIN -->
+# CotabbyInference Coding Instructions
 
-# RocketRide — AI Pipeline Builder
+CotabbyInference is Cotabby's product-specific C++ wrapper around llama.cpp. Preserve its narrow
+single-sequence boundary unless a shipping Cotabby requirement explicitly changes it.
 
-Use RocketRide when building AI pipelines, document processing, RAG systems, or data integration.
+## Ownership
 
-## Documentation
+- `CotabbyInferenceEngine` owns one model, one context, and at most one active sequence.
+- Cotabby's Swift `LlamaRuntimeCore` owns generation serialization, token budgets, prompt/cache
+  compatibility, streaming, and lifecycle admission.
+- The native engine owns sampler state, seed/pending-token handoff, KV mutation, token masks,
+  cancellation observation, and native resource release.
+- Do not add editor, Accessibility, UI, or hosted-service concepts to this package.
 
-Full docs: `.rocketride/docs/`
+## Native Safety
 
-**Read the relevant doc(s) before generating any RocketRide code.**
+- Keep the public header free of llama.cpp and ggml types.
+- Treat `SampleResult.piece` as borrowed memory that expires when sequence storage changes.
+- Serialize every llama context mutation through `decode_mutex`.
+- Keep cancellation atomic and nonblocking; an active `llama_decode` is not preemptible.
+- Never destroy a sequence or unload the model while another non-cancellation operation is using it.
+- Preserve the changing external sequence ID even though the internal llama sequence slot is fixed
+  at zero; it protects replacement sequences from late cancellation.
 
-| File                              | Read when...                                                      |
-| --------------------------------- | ----------------------------------------------------------------- |
-| ROCKETRIDE_README.md              | Starting any RocketRide work — overview + mandatory setup steps   |
-| ROCKETRIDE_QUICKSTART.md          | Writing first pipeline — complete working examples (Python & TS)  |
-| ROCKETRIDE_PIPELINE_RULES.md      | Defining pipelines — structure, lane wiring, config rules         |
-| ROCKETRIDE_COMPONENT_REFERENCE.md | Choosing/configuring components — all providers and config fields |
-| ROCKETRIDE_COMMON_MISTAKES.md     | Before finalizing — known pitfalls to avoid                       |
-| ROCKETRIDE_python_API.md          | Python SDK — client methods, types, patterns                      |
-| ROCKETRIDE_typescript_API.md      | TypeScript SDK — client methods, types, patterns                  |
-| ROCKETRIDE_OBSERVABILITY.md       | Consuming runtime logs, lifecycle events, and pipeline traces     |
+## Change Strategy
 
-## Before Writing ANY RocketRide Code
+- Add only APIs used by the current Cotabby integration or backed by a concrete consumer plan.
+- Prefer removing obsolete experimental surfaces over retaining speculative generality.
+- Treat the llama.cpp binary URL/checksum as a native compatibility boundary.
+- Update `README.md`, package tests, and local `.internal/` notes when architecture changes.
+- Keep `.internal/` gitignored; it is local study material, not PR content.
 
-1. Read `.rocketride/docs/ROCKETRIDE_README.md` for mandatory setup requirements
-2. Read the relevant API doc (Python or TypeScript) for your language
-3. Read `.rocketride/docs/ROCKETRIDE_PIPELINE_RULES.md` + `.rocketride/docs/ROCKETRIDE_COMPONENT_REFERENCE.md`
-4. Read `.rocketride/docs/ROCKETRIDE_COMMON_MISTAKES.md` before finalizing
-<!-- ROCKETRIDE:END -->
+## Validation
+
+Run `swift test` for compilation and no-model contracts. When a GGUF is available, also run:
+
+~~~bash
+COTABBY_TEST_MODEL_PATH=/absolute/path/model.gguf swift test
+~~~
+
+For public API changes, build the current Cotabby app against the local package before merging.
