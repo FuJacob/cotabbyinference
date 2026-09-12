@@ -80,6 +80,16 @@ public:
     // the constraint clears. Set this before `decodePrompt`, which samples the first (seed) token.
     void setForceWordContinuation(int32_t sequence_id, bool enabled);
 
+    // Constrains the generation on `sequence_id` to begin with the UTF-8 bytes `utf8[0..length)`.
+    // While any of them are unconsumed, only tokens whose text is a prefix of the remainder, or
+    // that the remainder is a prefix of, can be sampled; the remainder shrinks by each sampled
+    // token's text and the constraint clears once it is empty. This is how a caller completes a
+    // word the user has half typed: prompt up to the word boundary (so the tokenizer sees whole
+    // words, not a word cut at an arbitrary byte) and require the completion to start with the
+    // boundary whitespace plus the typed letters. Set before `decodePrompt`, which samples the
+    // first token; an empty prefix clears any pending constraint.
+    void setRequiredPrefix(int32_t sequence_id, const char* utf8, int length);
+
     // Controls whether `SampleResult.logprob` is computed for this sequence. Defaults to true
     // (the historical behavior). The log-probability costs two O(vocab-size) passes per generated
     // token, so callers whose confidence gating is disabled should pass false to skip it; results

@@ -112,6 +112,10 @@ struct SequenceState {
     // Set by setForceWordContinuation; consumed (and cleared) when the next seed token is sampled.
     bool force_word_continuation = false;
 
+    // Bytes the generation must still produce before it runs free (see setRequiredPrefix). Each
+    // sampled token's text is consumed from the front; empty means unconstrained.
+    std::string required_prefix;
+
     // Whether computeLogprob runs for this sequence's tokens. Defaults to true (the historical
     // behavior) so existing callers keep getting real log-probabilities; callers whose confidence
     // gate is disabled opt out via setComputeLogprob to skip two O(vocab) passes per token.
@@ -154,6 +158,9 @@ struct CotabbyInferenceEngine::Impl {
     std::vector<llama_logit_bias> nonprintable_bias;
     std::vector<llama_logit_bias> linebreak_bias;
     std::vector<bool> starts_new_word;
+    // Every token's plain-rendered text, so a required-prefix mask can compare bytes without
+    // calling the tokenizer per token on the hot path. Empty for tokens that render to nothing.
+    std::vector<std::string> token_pieces;
 
     // One product sequence with a monotonically changing external identity. The mutex protects
     // create/destroy and lookup; callers still must not destroy the sequence while another method
@@ -250,6 +257,7 @@ struct CotabbyInferenceEngine::Impl {
 
         const int32_t n = llama_vocab_n_tokens(vocab);
         starts_new_word.assign(static_cast<size_t>(n), false);
+        token_pieces.assign(static_cast<size_t>(n), std::string());
 
         // BOS belongs at sequence start only; some vocabularies ship it without the control
         // attribute, which would otherwise let it be sampled mid-text.
@@ -286,6 +294,7 @@ struct CotabbyInferenceEngine::Impl {
             if (written <= 0) {
                 continue;
             }
+            token_pieces[static_cast<size_t>(t)].assign(piece, static_cast<size_t>(written));
             const char first = piece[0];
             if (first == ' ' || first == '\t' || first == '\n' || first == '\r') {
                 starts_new_word[static_cast<size_t>(t)] = true;
@@ -312,6 +321,48 @@ struct CotabbyInferenceEngine::Impl {
             if (starts_new_word[static_cast<size_t>(t)]) {
                 logits[t] = -INFINITY;
             }
+        }
+    }
+
+    // Masks every token whose text cannot begin the still-required bytes `remaining`: a token is
+    // consistent when its text is a prefix of `remaining` (it consumes part of it) or `remaining` is
+    // a prefix of its text (it consumes all of it and continues). Tokens that render to nothing,
+    // EOG among them, are never consistent. Returns false, masking nothing, in the pathological
+    // case where no token is consistent, so the sampler is never handed an all-masked row.
+    bool maskInconsistentWithPrefix(int logits_row, const std::string& remaining) {
+        if (!shared_ctx || !vocab || remaining.empty()) return false;
+        float* logits = llama_get_logits_ith(shared_ctx, logits_row);
+        if (!logits) return false;
+        const size_t n = token_pieces.size();
+        std::vector<bool> consistent(n, false);
+        size_t consistent_count = 0;
+        for (size_t t = 0; t < n; ++t) {
+            const std::string& piece = token_pieces[t];
+            if (piece.empty()) continue;
+            const size_t overlap = std::min(piece.size(), remaining.size());
+            if (remaining.compare(0, overlap, piece, 0, overlap) == 0) {
+                consistent[t] = true;
+                ++consistent_count;
+            }
+        }
+        if (consistent_count == 0) return false;
+        for (size_t t = 0; t < n; ++t) {
+            if (!consistent[t]) {
+                logits[t] = -INFINITY;
+            }
+        }
+        return true;
+    }
+
+    // Consumes a sampled token's text from the sequence's required prefix.
+    void consumeRequiredPrefix(SequenceState* seq, llama_token token) const {
+        if (!seq || seq->required_prefix.empty()) return;
+        const size_t index = static_cast<size_t>(token);
+        const size_t consumed = index < token_pieces.size() ? token_pieces[index].size() : 0;
+        if (consumed >= seq->required_prefix.size()) {
+            seq->required_prefix.clear();
+        } else {
+            seq->required_prefix.erase(0, consumed);
         }
     }
 
@@ -629,11 +680,17 @@ EngineStatus CotabbyInferenceEngine::decodePrompt(int32_t sequence_id,
         impl_->maskNewWordStarts(-1);
         seq->force_word_continuation = false;
     }
+    // Required-prefix constraint (see setRequiredPrefix): the seed must begin the required bytes.
+    // A row with no consistent token drops the constraint rather than sampling from nothing.
+    if (!seq->required_prefix.empty() && !impl_->maskInconsistentWithPrefix(-1, seq->required_prefix)) {
+        seq->required_prefix.clear();
+    }
 
     // Seed sample: take one token from the prompt's final logits row. The seed will be returned by
     // the next sampleNext call as-is and feedback-decoded by the call after that.
     llama_token seed = llama_sampler_sample(seq->sampler, impl_->shared_ctx, -1);
     llama_sampler_accept(seq->sampler, seed);
+    impl_->consumeRequiredPrefix(seq, seed);
     seq->seed_token = seed;
     seq->seed_logprob = seq->compute_logprob ? impl_->computeLogprob(-1, seed) : 0.0f;
     seq->seed_argmax_is_eog = impl_->argmaxIsEOG(-1);
@@ -737,7 +794,11 @@ SampleResult CotabbyInferenceEngine::sampleNext(int32_t sequence_id) {
     } else if (seq->cancelled.load(std::memory_order_acquire)) {
         result.was_cancelled = true;
     } else {
+        if (!seq->required_prefix.empty() && !impl_->maskInconsistentWithPrefix(0, seq->required_prefix)) {
+            seq->required_prefix.clear();
+        }
         const llama_token next = llama_sampler_sample(seq->sampler, impl_->shared_ctx, 0);
+        impl_->consumeRequiredPrefix(seq, next);
         result.argmax_is_eog = impl_->argmaxIsEOG(0);
         result.token = next;
 
@@ -820,6 +881,17 @@ void CotabbyInferenceEngine::setForceWordContinuation(int32_t sequence_id, bool 
     if (seq) {
         seq->force_word_continuation = enabled;
     }
+}
+
+void CotabbyInferenceEngine::setRequiredPrefix(int32_t sequence_id, const char* utf8, int length) {
+    if (!impl_) return;
+    SequenceState* seq = impl_->findSequence(sequence_id);
+    if (!seq) return;
+    if (!utf8 || length <= 0) {
+        seq->required_prefix.clear();
+        return;
+    }
+    seq->required_prefix.assign(utf8, static_cast<size_t>(length));
 }
 
 void CotabbyInferenceEngine::setComputeLogprob(int32_t sequence_id, bool enabled) {

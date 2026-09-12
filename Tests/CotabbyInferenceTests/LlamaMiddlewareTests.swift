@@ -149,6 +149,42 @@ final class LlamaMiddlewareTests: XCTestCase {
         engine.destroySequence(sequence)
     }
 
+    func testRequiredPrefixConstrainsTheStartOfTheCompletion() throws {
+        let modelPath = try Self.modelPath()
+        var engine = CotabbyInferenceEngine()
+        XCTAssertEqual(engine.loadModel(modelPath, -1, 1024, 256), EngineStatus.ok)
+        defer { engine.unloadModel() }
+
+        // The user has typed "Thanks for sending over the draft yest": the prompt stops at the word
+        // boundary and the completion must begin with the boundary space plus the typed letters, so
+        // the model completes the word the user started instead of a word cut at a token boundary.
+        let sequence = engine.createSequence(Self.samplingConfig(temperature: 0))
+        let prompt = "Thanks for sending over the draft"
+        var tokens = Array(engine.tokenize(prompt, Int32(prompt.utf8.count)))
+        let required = " yest"
+        required.withCString { engine.setRequiredPrefix(sequence, $0, Int32(required.utf8.count)) }
+        XCTAssertEqual(
+            engine.decodePrompt(sequence, &tokens, Int32(tokens.count), 0),
+            EngineStatus.ok
+        )
+
+        var text = ""
+        for _ in 0 ..< 12 {
+            let result = engine.sampleNext(sequence)
+            if result.is_eos || result.was_cancelled { break }
+            text += Self.string(from: result)
+        }
+        XCTAssertTrue(text.hasPrefix(required), "got \(text)")
+        XCTAssertTrue(text.hasPrefix(" yesterday"), "the model should finish the word: \(text)")
+        engine.destroySequence(sequence)
+    }
+
+    func testRequiredPrefixIsClearedByAnEmptyPrefixAndIgnoredWithoutASequence() throws {
+        var engine = CotabbyInferenceEngine()
+        "abc".withCString { engine.setRequiredPrefix(999, $0, 3) }
+        engine.setRequiredPrefix(999, nil, 0)
+    }
+
     func testSampleNextReportsFiniteLogprob() throws {
         let modelPath = try Self.modelPath()
         var engine = CotabbyInferenceEngine()
