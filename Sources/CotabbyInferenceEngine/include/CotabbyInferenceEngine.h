@@ -40,6 +40,15 @@ enum class EngineStatus : int {
     not_loaded = 3,
 };
 
+// A snapshot for logs/tests; no prompt or generated content crosses this diagnostics boundary.
+struct CacheDiagnostics {
+    int decoded_token_count = 0;
+    int checkpoint_position = 0;
+    uint64_t checkpoint_bytes = 0;
+    int last_restore_replayed_tokens = 0;
+    bool uses_partial_checkpoint = false;
+};
+
 class CotabbyInferenceEngine {
 public:
     CotabbyInferenceEngine();
@@ -64,6 +73,11 @@ public:
 
     // Tokenization (thread-safe, read-only on vocab)
     std::vector<int32_t> tokenize(const char* text, int text_length) const;
+    // Plain decoded bytes for one printable token; special/unknown tokens return empty.
+    std::vector<uint8_t> tokenPiece(int32_t token) const;
+    // The next continuation must reproduce these already-typed bytes before adding new text.
+    // Set before decodePrompt. Matching may span several byte-fallback tokens.
+    void setCompletionPrefix(int32_t sequence_id, const uint8_t* bytes, int length);
     // Prompt decoding
     EngineStatus decodePrompt(int32_t sequence_id,
                               const int32_t* tokens, int token_count,
@@ -94,6 +108,7 @@ public:
     int getBatchSize() const;
     int getThreadCount() const;
     int getGPULayerCount() const;
+    CacheDiagnostics getCacheDiagnostics(int32_t sequence_id) const;
 
 private:
     struct Impl;

@@ -1,4 +1,5 @@
 #include "CotabbyInferenceEngine.h"
+#include "TokenHealing.h"
 
 #include <algorithm>
 #include <atomic>
@@ -102,6 +103,23 @@ struct SequenceState {
     int kv_position_count = 0;
     std::atomic<bool> cancelled{false};
     std::string last_piece;
+    // A failed llama_decode may have partially changed native memory without advancing our
+    // committed-token count. Never let trimKV's equal-position fast path certify that state.
+    bool cache_valid = true;
+
+    // Exact committed tokens, excluding a sampled token that has not reached llama_decode.
+    // The sampler can then be reset to the *writer's* prompt when a prediction is discarded.
+    std::vector<llama_token> decoded_tokens;
+
+    // Hybrid/recurrent models cannot erase arbitrary suffixes, and a sliding window may already
+    // have evicted the old prompt's attention rows. Keep one partial-state checkpoint near the
+    // caret; full attention KV stays in llama's device buffers. This is per sequence, never disk.
+    std::vector<uint8_t> prompt_checkpoint;
+    size_t checkpoint_memory_bytes = 0;
+    int checkpoint_position = 0;
+    int last_restore_replayed_tokens = 0;
+    cotabby::TokenPrefix completion_prefix;
+    bool single_line = false;
 
     llama_token seed_token = 0;
     bool has_seed_token = false;
@@ -147,6 +165,12 @@ struct CotabbyInferenceEngine::Impl {
     int batch_size = 0;
     int thread_count = 0;
     int gpu_layer_count = 0;
+    bool needs_prompt_checkpoint = false;
+
+    // Eight tokens cover ordinary retokenization/backspace near the caret while keeping replay
+    // bounded. One saved state avoids n_rs_seq's multiplication of every recurrent state tensor.
+    static constexpr int CHECKPOINT_TAIL_TOKENS = 8;
+    static constexpr size_t MAX_CHECKPOINT_BYTES = 128 * 1024 * 1024;
 
     // Token masks built once per model load (see buildTokenMasks). EOG tokens are deliberately
     // excluded so the stop check still fires; they are never emitted as text. `starts_new_word`
@@ -154,6 +178,7 @@ struct CotabbyInferenceEngine::Impl {
     std::vector<llama_logit_bias> nonprintable_bias;
     std::vector<llama_logit_bias> linebreak_bias;
     std::vector<bool> starts_new_word;
+    cotabby::TokenHealingVocabulary healing_vocabulary;
 
     // One product sequence with a monotonically changing external identity. The mutex protects
     // create/destroy and lookup; callers still must not destroy the sequence while another method
@@ -165,6 +190,104 @@ struct CotabbyInferenceEngine::Impl {
     // Serializes every llama context mutation. Cotabby's Swift wrapper already orders generation,
     // prefill, trim, and reset, while cancellation only touches the sequence's atomic flag.
     std::mutex decode_mutex;
+
+    std::string tokenPiece(llama_token token) const {
+        if (!vocab || token < 0 || token >= llama_vocab_n_tokens(vocab) ||
+            llama_vocab_is_control(vocab, token) || llama_vocab_is_eog(vocab, token) ||
+            (llama_vocab_get_attr(vocab, token) &
+             (LLAMA_TOKEN_ATTR_UNKNOWN | LLAMA_TOKEN_ATTR_UNUSED)) != 0) return {};
+        std::string result(64, '\0');
+        int size = llama_token_to_piece(vocab, token, result.data(), static_cast<int32_t>(result.size()), 0, false);
+        if (size < 0) {
+            result.resize(-size);
+            size = llama_token_to_piece(vocab, token, result.data(), static_cast<int32_t>(result.size()), 0, false);
+        }
+        if (size <= 0) return {};
+        result.resize(size);
+        return result;
+    }
+
+    // Hard-constrain only the short replay prefix. A compatible token may finish the typed
+    // prefix and include new letters, or may cover only its first bytes (byte fallback).
+    bool maskCompletionPrefix(const SequenceState& seq, int logits_row) const {
+        if (seq.completion_prefix.empty()) return true;
+        const auto allowed = healing_vocabulary.matchingTokens(seq.completion_prefix.remaining(), seq.single_line);
+        if (allowed.empty()) return false;
+        float* logits = llama_get_logits_ith(shared_ctx, logits_row);
+        if (!logits) return false;
+        std::vector<float> values;
+        values.reserve(allowed.size());
+        for (const auto token : allowed) values.push_back(logits[token]);
+        std::fill_n(logits, llama_vocab_n_tokens(vocab), -INFINITY);
+        for (size_t index = 0; index < allowed.size(); ++index) {
+            logits[allowed[index]] = values[index];
+        }
+        return true;
+    }
+
+    // Called under decode_mutex after a complete batch. Saving only partial memory is sufficient:
+    // ordinary attention retains all earlier KV, while recurrent/SWA memory must be restored.
+    void savePromptCheckpoint(SequenceState& seq) {
+        seq.prompt_checkpoint.clear();
+        seq.checkpoint_memory_bytes = 0;
+        seq.checkpoint_position = 0;
+        if (!needs_prompt_checkpoint || seq.kv_position_count <= 0) return;
+        // Query the host size only to bound memory; ON_DEVICE retains tensor data in llama's
+        // single slot-zero checkpoint buffer instead of transferring ~20 MiB through the CPU on
+        // every keystroke. Its small serialized blob contains metadata, not ownership of tensors.
+        const size_t memory_bytes = llama_state_seq_get_size_ext(
+            shared_ctx, SEQUENCE_ID, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        if (memory_bytes == 0 || memory_bytes > MAX_CHECKPOINT_BYTES) return;
+        constexpr auto flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE;
+        const size_t size = llama_state_seq_get_size_ext(shared_ctx, SEQUENCE_ID, flags);
+        if (size == 0) return;
+        seq.prompt_checkpoint.resize(size);
+        if (llama_state_seq_get_data_ext(shared_ctx, seq.prompt_checkpoint.data(), size,
+                                        SEQUENCE_ID, flags) != size) {
+            seq.prompt_checkpoint.clear();
+            return;
+        }
+        seq.checkpoint_memory_bytes = memory_bytes;
+        seq.checkpoint_position = seq.kv_position_count;
+    }
+
+    // Restoring must precede seq_rm: the hybrid implementation asks its recurrent cache first,
+    // and that cache cannot erase a suffix until its earlier state has been reinstalled.
+    bool restorePromptCheckpoint(SequenceState& seq, int keep_positions) {
+        if (seq.prompt_checkpoint.empty() || keep_positions < seq.checkpoint_position ||
+            keep_positions > static_cast<int>(seq.decoded_tokens.size()) ||
+            keep_positions - seq.checkpoint_position > CHECKPOINT_TAIL_TOKENS) return false;
+        constexpr auto flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE;
+        if (llama_state_seq_set_data_ext(shared_ctx, seq.prompt_checkpoint.data(),
+                seq.prompt_checkpoint.size(), SEQUENCE_ID, flags) != seq.prompt_checkpoint.size()) {
+            return false;
+        }
+        if (!llama_memory_seq_rm(llama_get_memory(shared_ctx), SEQUENCE_ID,
+                                 seq.checkpoint_position, -1)) return false;
+
+        // At most CHECKPOINT_TAIL_TOKENS prompt tokens are replayed in the normal path. Do not
+        // sample during restoration: it must not advance RNG, penalties, or the visible output.
+        const int count = keep_positions - seq.checkpoint_position;
+        if (count > 0) {
+            llama_batch batch = llama_batch_init(count, 0, 1);
+            batch.n_tokens = count;
+            for (int i = 0; i < count; ++i) {
+                batch.token[i] = seq.decoded_tokens[seq.checkpoint_position + i];
+                batch.pos[i] = seq.checkpoint_position + i;
+                batch.n_seq_id[i] = 1;
+                batch.seq_id[i][0] = SEQUENCE_ID;
+                batch.logits[i] = 0;
+            }
+            const int status = llama_decode(shared_ctx, batch);
+            llama_batch_free(batch);
+            if (status != 0) {
+                seq.cache_valid = false;
+                return false;
+            }
+        }
+        seq.last_restore_replayed_tokens = count;
+        return true;
+    }
 
     SequenceState* findSequence(int32_t id) {
         std::lock_guard<std::mutex> lock(sequence_mutex);
@@ -246,6 +369,7 @@ struct CotabbyInferenceEngine::Impl {
         nonprintable_bias.clear();
         linebreak_bias.clear();
         starts_new_word.clear();
+        healing_vocabulary.clear();
         if (!vocab) return;
 
         const int32_t n = llama_vocab_n_tokens(vocab);
@@ -256,6 +380,7 @@ struct CotabbyInferenceEngine::Impl {
         const llama_token bos_token = llama_vocab_bos(vocab);
 
         char piece[64];
+        std::vector<cotabby::TokenHealingVocabulary::Entry> healing_entries;
         for (llama_token t = 0; t < n; ++t) {
             const bool is_eog = llama_vocab_is_eog(vocab, t);
 
@@ -282,6 +407,11 @@ struct CotabbyInferenceEngine::Impl {
                 }
             }
 
+            auto plain_piece = tokenPiece(t);
+            if (!plain_piece.empty() && !isScaffoldingMarkerPiece(plain_piece.data(), static_cast<int>(plain_piece.size()))) {
+                healing_entries.push_back({t, std::move(plain_piece)});
+            }
+
             const int written = llama_token_to_piece(vocab, t, piece, sizeof(piece), 0, false);
             if (written <= 0) {
                 continue;
@@ -299,6 +429,7 @@ struct CotabbyInferenceEngine::Impl {
                 }
             }
         }
+        healing_vocabulary.reset(std::move(healing_entries));
     }
 
     // Masks every "starts a new word" token (decoded text begins with whitespace) in the logits
@@ -424,6 +555,8 @@ EngineStatus CotabbyInferenceEngine::loadModel(const char* path, int gpu_layers,
     impl_->context_window_tokens = context_window_tokens;
     impl_->batch_size = batch_size;
     impl_->gpu_layer_count = gpu_layers;
+    impl_->needs_prompt_checkpoint = llama_model_is_recurrent(impl_->model) ||
+        llama_model_is_hybrid(impl_->model) || llama_model_n_swa(impl_->model) > 0;
     // Performance cores only — see resolveDecodeThreadCount. hardware_concurrency() counted
     // every logical core including efficiency cores, which both slows barriered matmuls and
     // burns extra package power for nothing when layers are Metal-offloaded anyway.
@@ -471,6 +604,7 @@ void CotabbyInferenceEngine::unloadModel() {
     }
     impl_->vocab = nullptr;
     impl_->model_path.clear();
+    impl_->needs_prompt_checkpoint = false;
 
     if (impl_->backend_initialized) {
         llama_backend_free();
@@ -495,6 +629,7 @@ int32_t CotabbyInferenceEngine::createSequence(SamplingConfig config) {
     auto state = std::make_unique<SequenceState>();
     state->external_id = id;
     state->sampler = sampler;
+    state->single_line = config.single_line;
     impl_->sequence = std::move(state);
     return id;
 }
@@ -574,6 +709,9 @@ EngineStatus CotabbyInferenceEngine::decodePrompt(int32_t sequence_id,
 
     SequenceState* seq = impl_->findSequence(sequence_id);
     if (!seq) return EngineStatus::error;
+    if (!seq->cache_valid) return EngineStatus::error;
+    if (start_position < 0 || start_position != seq->kv_position_count ||
+        start_position != static_cast<int>(seq->decoded_tokens.size())) return EngineStatus::error;
 
     if (seq->cancelled.load(std::memory_order_acquire)) {
         return EngineStatus::cancelled;
@@ -587,6 +725,12 @@ EngineStatus CotabbyInferenceEngine::decodePrompt(int32_t sequence_id,
     int cursor = 0;
     int end = token_count;
     int total_end_position = start_position + token_count;
+    const int checkpoint_position = std::max(start_position,
+        total_end_position - Impl::CHECKPOINT_TAIL_TOKENS);
+
+    if (impl_->needs_prompt_checkpoint && checkpoint_position == start_position) {
+        impl_->savePromptCheckpoint(*seq);
+    }
 
     while (cursor < end) {
         if (seq->cancelled.load(std::memory_order_acquire)) {
@@ -595,6 +739,10 @@ EngineStatus CotabbyInferenceEngine::decodePrompt(int32_t sequence_id,
         }
 
         int chunk_end = std::min(cursor + batch_cap, end);
+        // Split at the checkpoint boundary once, before decoding the final prompt tail.
+        if (impl_->needs_prompt_checkpoint && start_position + cursor < checkpoint_position) {
+            chunk_end = std::min(chunk_end, checkpoint_position - start_position);
+        }
         int chunk_size = chunk_end - cursor;
 
         batch.n_tokens = static_cast<int32_t>(chunk_size);
@@ -612,20 +760,37 @@ EngineStatus CotabbyInferenceEngine::decodePrompt(int32_t sequence_id,
         }
 
         if (llama_decode(impl_->shared_ctx, batch) != 0) {
+            seq->cache_valid = false;
             llama_batch_free(batch);
             return EngineStatus::error;
         }
 
         cursor = chunk_end;
+        seq->decoded_tokens.insert(seq->decoded_tokens.end(), tokens + cursor - chunk_size,
+                                   tokens + cursor);
+        seq->kv_position_count = start_position + cursor;
+        if (impl_->needs_prompt_checkpoint && seq->kv_position_count == checkpoint_position) {
+            impl_->savePromptCheckpoint(*seq);
+        }
     }
 
     llama_batch_free(batch);
     seq->kv_position_count = total_end_position;
 
+    // Reuse must produce the same sampler state as a fresh request. Discarded model text must
+    // never enter repetition history or advance this request's random stream. Only actual prompt
+    // tokens are accepted here; llama_sampler_sample accepts each generated token itself.
+    llama_sampler_reset(seq->sampler);
+    for (const llama_token token : seq->decoded_tokens) {
+        llama_sampler_accept(seq->sampler, token);
+    }
+
     // First-token word-continuation constraint: when the caret is mid-word, mask new-word-start
     // tokens for this seed only so the completion continues the current word instead of starting
     // a new one. The flag clears after this single token.
-    if (seq->force_word_continuation) {
+    const bool healing = !seq->completion_prefix.empty();
+    if (healing && !impl_->maskCompletionPrefix(*seq, -1)) return EngineStatus::error;
+    if (!healing && seq->force_word_continuation) {
         impl_->maskNewWordStarts(-1);
         seq->force_word_continuation = false;
     }
@@ -633,10 +798,10 @@ EngineStatus CotabbyInferenceEngine::decodePrompt(int32_t sequence_id,
     // Seed sample: take one token from the prompt's final logits row. The seed will be returned by
     // the next sampleNext call as-is and feedback-decoded by the call after that.
     llama_token seed = llama_sampler_sample(seq->sampler, impl_->shared_ctx, -1);
-    llama_sampler_accept(seq->sampler, seed);
+    if (healing && !seq->completion_prefix.consume(impl_->tokenPiece(seed))) return EngineStatus::error;
     seq->seed_token = seed;
     seq->seed_logprob = seq->compute_logprob ? impl_->computeLogprob(-1, seed) : 0.0f;
-    seq->seed_argmax_is_eog = impl_->argmaxIsEOG(-1);
+    seq->seed_argmax_is_eog = !healing && impl_->argmaxIsEOG(-1);
     seq->has_seed_token = true;
     seq->has_pending_input = false;
 
@@ -665,6 +830,10 @@ SampleResult CotabbyInferenceEngine::sampleNext(int32_t sequence_id) {
 
     SequenceState* seq = impl_->findSequence(sequence_id);
     if (!seq) {
+        result.is_eos = true;
+        return result;
+    }
+    if (!seq->cache_valid) {
         result.is_eos = true;
         return result;
     }
@@ -732,20 +901,37 @@ SampleResult CotabbyInferenceEngine::sampleNext(int32_t sequence_id) {
     batch.logits[0] = 1;
 
     const int status = llama_decode(impl_->shared_ctx, batch);
+    if (status == 0) {
+        // Decoding advances memory even if the *next* sample is EOS or cancellation arrives
+        // immediately afterward. Track that committed position before either early return.
+        seq->decoded_tokens.push_back(seq->pending_input_token);
+        seq->kv_position_count++;
+    }
     if (status != 0) {
+        seq->cache_valid = false;
         result.is_eos = true;
     } else if (seq->cancelled.load(std::memory_order_acquire)) {
         result.was_cancelled = true;
     } else {
+        const bool healing = !seq->completion_prefix.empty();
+        if (healing && !impl_->maskCompletionPrefix(*seq, 0)) {
+            llama_batch_free(batch);
+            result.is_eos = true;
+            return result;
+        }
         const llama_token next = llama_sampler_sample(seq->sampler, impl_->shared_ctx, 0);
-        result.argmax_is_eog = impl_->argmaxIsEOG(0);
+        if (healing && !seq->completion_prefix.consume(impl_->tokenPiece(next))) {
+            llama_batch_free(batch);
+            result.is_eos = true;
+            return result;
+        }
+        result.argmax_is_eog = !healing && impl_->argmaxIsEOG(0);
         result.token = next;
 
         if (next == llama_vocab_eos(impl_->vocab) ||
             llama_vocab_is_eog(impl_->vocab, next)) {
             result.is_eos = true;
         } else {
-            llama_sampler_accept(seq->sampler, next);
             seq->last_piece.resize(64);
             while (true) {
                 const int written = llama_token_to_piece(
@@ -775,7 +961,6 @@ SampleResult CotabbyInferenceEngine::sampleNext(int32_t sequence_id) {
 
     // Feedback decode advanced KV by one position; record the just-sampled
     // token as input for the next call.
-    seq->kv_position_count++;
     seq->pending_input_token = result.token;
     seq->has_pending_input = true;
     return result;
@@ -789,6 +974,10 @@ bool CotabbyInferenceEngine::trimKV(int32_t sequence_id, int keep_positions) {
     if (!impl_->shared_ctx) return false;
     SequenceState* seq = impl_->findSequence(sequence_id);
     if (!seq) return false;
+    // Only destruction can recover an uncertain native decode. This check must precede the
+    // keep_positions == kv_position_count shortcut: an unchanged counter is not proof of valid KV.
+    if (!seq->cache_valid) return false;
+    if (keep_positions < 0 || keep_positions > seq->kv_position_count) return false;
 
     llama_memory_t memory = llama_get_memory(impl_->shared_ctx);
     if (!memory) return false;
@@ -796,20 +985,34 @@ bool CotabbyInferenceEngine::trimKV(int32_t sequence_id, int keep_positions) {
     // Serialize with prompt and feedback decode; never remove KV while llama is mutating it.
     std::lock_guard<std::mutex> lock(impl_->decode_mutex);
 
-    bool ok = llama_memory_seq_rm(
-        memory,
-        Impl::SEQUENCE_ID,
-        static_cast<llama_pos>(keep_positions),
-        -1
-    );
+    bool ok;
+    seq->last_restore_replayed_tokens = 0;
+    if (keep_positions == 0) {
+        ok = llama_memory_seq_rm(memory, Impl::SEQUENCE_ID, 0, -1);
+        seq->prompt_checkpoint.clear();
+        seq->checkpoint_memory_bytes = 0;
+        seq->checkpoint_position = 0;
+    } else if (keep_positions == seq->kv_position_count) {
+        // A sampled seed is not decoded until the following sampleNext. Prefill therefore
+        // already has exactly prompt KV and must not require a recurrent rollback.
+        ok = true;
+    } else if (impl_->needs_prompt_checkpoint) {
+        ok = impl_->restorePromptCheckpoint(*seq, keep_positions);
+    } else {
+        ok = llama_memory_seq_rm(memory, Impl::SEQUENCE_ID, keep_positions, -1);
+    }
 
     if (ok) {
         seq->kv_position_count = keep_positions;
+        seq->decoded_tokens.resize(keep_positions);
         // Any seed/pending input is now stale (it would feedback-decode into
         // a trimmed-away position). Caller must call decodePrompt to re-seed
         // before the next sampleNext.
         seq->has_seed_token = false;
         seq->has_pending_input = false;
+        // A cancellation applies to the abandoned operation. Rearm only after memory has been
+        // restored successfully; a failed restore requires the caller to destroy the sequence.
+        seq->cancelled.store(false, std::memory_order_release);
     }
     return ok;
 }
@@ -819,6 +1022,23 @@ void CotabbyInferenceEngine::setForceWordContinuation(int32_t sequence_id, bool 
     SequenceState* seq = impl_->findSequence(sequence_id);
     if (seq) {
         seq->force_word_continuation = enabled;
+    }
+}
+
+std::vector<uint8_t> CotabbyInferenceEngine::tokenPiece(int32_t token) const {
+    if (!impl_) return {};
+    const auto bytes = impl_->tokenPiece(token);
+    return {bytes.begin(), bytes.end()};
+}
+
+void CotabbyInferenceEngine::setCompletionPrefix(int32_t sequence_id, const uint8_t* bytes, int length) {
+    if (!impl_) return;
+    auto* seq = impl_->findSequence(sequence_id);
+    if (!seq) return;
+    if (!bytes || length <= 0) {
+        seq->completion_prefix.clear();
+    } else {
+        seq->completion_prefix.reset(std::string(reinterpret_cast<const char*>(bytes), length));
     }
 }
 
@@ -835,9 +1055,12 @@ void CotabbyInferenceEngine::setComputeLogprob(int32_t sequence_id, bool enabled
 // ---------------------------------------------------------------------------
 
 void CotabbyInferenceEngine::cancelSequence(int32_t sequence_id) {
-    SequenceState* seq = impl_->findSequence(sequence_id);
-    if (seq) {
-        seq->cancelled.store(true, std::memory_order_release);
+    if (!impl_) return;
+    // Keep ownership locked through the store. Looking up a raw pointer and dropping the lock
+    // first races sequence destruction from the generation thread.
+    std::lock_guard<std::mutex> lock(impl_->sequence_mutex);
+    if (impl_->sequence && impl_->sequence->external_id == sequence_id) {
+        impl_->sequence->cancelled.store(true, std::memory_order_release);
     }
 }
 
@@ -859,4 +1082,17 @@ int CotabbyInferenceEngine::getThreadCount() const {
 
 int CotabbyInferenceEngine::getGPULayerCount() const {
     return impl_->gpu_layer_count;
+}
+
+CacheDiagnostics CotabbyInferenceEngine::getCacheDiagnostics(int32_t sequence_id) const {
+    CacheDiagnostics result;
+    if (!impl_) return result;
+    const auto* seq = impl_->findSequence(sequence_id);
+    if (!seq) return result;
+    result.decoded_token_count = seq->kv_position_count;
+    result.checkpoint_position = seq->checkpoint_position;
+    result.checkpoint_bytes = seq->checkpoint_memory_bytes;
+    result.last_restore_replayed_tokens = seq->last_restore_replayed_tokens;
+    result.uses_partial_checkpoint = impl_->needs_prompt_checkpoint;
+    return result;
 }

@@ -32,3 +32,10 @@ jobs:
 
       - name: Test
         run: swift test
+
+      - name: Test token healing without a model
+        run: |
+          clang++ -std=c++17 -I Sources/CotabbyInferenceEngine \
+            Sources/CotabbyInferenceEngine/TokenHealing.cpp Tests/TokenHealingTests.cpp \
+            -o /tmp/cotabby-token-healing-tests
+          /tmp/cotabby-token-healing-tests
