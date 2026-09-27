@@ -251,7 +251,8 @@ final class LlamaMiddlewareTests: XCTestCase {
     /// neither change the model state nor enter the repetition penalty's token history.
     func testRestoredPromptMatchesColdGenerationAndBoundsReplay() throws {
         var engine = CotabbyInferenceEngine()
-        XCTAssertEqual(engine.loadModel(try Self.modelPath(), -1, 1024, 256), .ok)
+        let modelPath = try Self.modelPath()
+        XCTAssertEqual(engine.loadModel(modelPath, -1, 1024, 256), .ok)
         defer { engine.unloadModel() }
         let prompt =
             "Hi Alex, thanks for sending the project update. I will review the schedule and send you my"
@@ -281,7 +282,8 @@ final class LlamaMiddlewareTests: XCTestCase {
     /// temperature make this request exercise the distribution sampler across repeated restores.
     func testRestoredSeededSamplingMatchesColdGeneration() throws {
         var engine = CotabbyInferenceEngine()
-        XCTAssertEqual(engine.loadModel(try Self.modelPath(), -1, 1024, 256), .ok)
+        let modelPath = try Self.modelPath()
+        XCTAssertEqual(engine.loadModel(modelPath, -1, 1024, 256), .ok)
         defer { engine.unloadModel() }
         let prompt = "Hi Alex, thanks for sending the project update. I will review the schedule and send you my"
         var tokens = Array(engine.tokenize(prompt, Int32(prompt.utf8.count)))
@@ -306,7 +308,8 @@ final class LlamaMiddlewareTests: XCTestCase {
 
     func testCancellationCanBeRearmedOnlyBySuccessfulRestoration() throws {
         var engine = CotabbyInferenceEngine()
-        XCTAssertEqual(engine.loadModel(try Self.modelPath(), -1, 1024, 256), .ok)
+        let modelPath = try Self.modelPath()
+        XCTAssertEqual(engine.loadModel(modelPath, -1, 1024, 256), .ok)
         defer { engine.unloadModel() }
         let prompt =
             "Thank you for your thoughtful comments on the document. I have updated the draft to include"
@@ -327,7 +330,8 @@ final class LlamaMiddlewareTests: XCTestCase {
 
     func testFailedPromptDecodeCannotBeReusedAtTrackedPosition() throws {
         var engine = CotabbyInferenceEngine()
-        XCTAssertEqual(engine.loadModel(try Self.modelPath(), -1, 64, 32), .ok)
+        let modelPath = try Self.modelPath()
+        XCTAssertEqual(engine.loadModel(modelPath, -1, 64, 32), .ok)
         defer { engine.unloadModel() }
         let sequence = engine.createSequence(Self.samplingConfig(temperature: 0))
         // Exceed a deliberately small attention context without an artificial failure hook.
@@ -357,7 +361,8 @@ final class LlamaMiddlewareTests: XCTestCase {
 
     func testHealingReproducesTypedBytesIncludingTrailingWhitespace() throws {
         var engine = CotabbyInferenceEngine()
-        XCTAssertEqual(engine.loadModel(try Self.modelPath(), -1, 1024, 256), .ok)
+        let modelPath = try Self.modelPath()
+        XCTAssertEqual(engine.loadModel(modelPath, -1, 1024, 256), .ok)
         defer { engine.unloadModel() }
         for prompt in ["Please send me the sched", "Please send me the ", "The café serves "] {
             var tokens = Array(engine.tokenize(prompt, Int32(prompt.utf8.count)))
@@ -387,7 +392,8 @@ final class LlamaMiddlewareTests: XCTestCase {
     /// No wall-clock threshold is asserted: CI hardware and Metal warmup vary substantially.
     func testWarmPromptDecodeReportsLatency() throws {
         var engine = CotabbyInferenceEngine()
-        XCTAssertEqual(engine.loadModel(try Self.modelPath(), -1, 1024, 256), .ok)
+        let modelPath = try Self.modelPath()
+        XCTAssertEqual(engine.loadModel(modelPath, -1, 1024, 256), .ok)
         defer { engine.unloadModel() }
         for paragraphCount in [2, 16, 64] {
             let prompt =
