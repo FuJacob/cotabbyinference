@@ -22,7 +22,7 @@ Cotabby LlamaRuntimeCore
 Cotabby serializes generation and prefill through its runtime lock, so the middleware does not
 reserve unused secondary sequence capacity or run a batching worker. Prompt decode, feedback decode,
 KV trim, and sequence destruction use one native context mutex. Cancellation is the intentional
-cross-thread operation and uses a one-way atomic flag.
+cross-thread operation and uses an atomic flag, rearmed only after successful cache restoration.
 
 The public sequence ID changes whenever a sequence is recreated even though llama's internal slot
 is always zero. That prevents a late cancellation from accidentally targeting a replacement
@@ -85,25 +85,28 @@ guard engine.decodePrompt(sequenceID, &tokens, Int32(tokens.count), 0) == .ok el
 }
 
 // The caller owns the generation budget.
+var completionBytes: [UInt8] = []
 for _ in 0 ..< 8 {
     let result = engine.sampleNext(sequenceID)
     if result.is_eos || result.was_cancelled { break }
 
     if let piece = result.piece, result.piece_length > 0 {
-        let text = String(
-            bytes: UnsafeBufferPointer(
+        completionBytes += Array(
+            UnsafeBufferPointer(
                 start: UnsafeRawPointer(piece).assumingMemoryBound(to: UInt8.self),
                 count: Int(result.piece_length)
-            ),
-            encoding: .utf8
-        ) ?? ""
-        print(text, terminator: "")
+            )
+        )
     }
+}
+if let text = String(bytes: completionBytes, encoding: .utf8) {
+    print(text)
 }
 ~~~
 
 `SampleResult.piece` is borrowed sequence storage. Copy it before another sampling call or sequence
-destruction.
+destruction. Its bytes can end inside a UTF-8 scalar; streaming clients must accumulate bytes before
+converting to text instead of discarding undecodable individual pieces.
 
 ## Generation Semantics
 
@@ -119,16 +122,55 @@ Cotabby controls the maximum token count in Swift. The engine controls token sel
   sampling selected visible text;
 - `logprob`: the selected token's raw-model log-probability when enabled.
 
+## Caret Token Healing
+
+`tokenPiece(token)` returns printable bytes for planning a completion. When the final prompt token
+exactly matches the typed suffix, the client can remove that token and pass its bytes to
+`setCompletionPrefix(sequence, bytes, length)` before `decodePrompt`. The sampler then admits only
+tokens compatible with that prefix, including byte-fallback tokens that cover part of it. This
+allows `sched` to participate in the token for `schedule` without altering the writer's text.
+
+`TokenHealingVocabulary` is built once per loaded model; the per-sequence `TokenPrefix` owns only
+the unconsumed replay bytes. The caller strips exactly those replayed bytes, preserves incomplete
+UTF-8 fragments, and budgets replay separately from visible continuation. Cotabby caps replay at
+16 bytes/tokens. While constrained, the legacy whitespace mask is bypassed and `argmax_is_eog`
+is false. No EOS/control tokens can complete an unfinished replay. Clear the prefix for requests
+that do not heal; sampler settings and cache lifetime do not imply the next request's prefix.
+
 ## KV Reuse and Cancellation
 
-`trimKV` removes a suffix from fixed llama sequence slot zero and invalidates any saved seed or
-pending feedback token. Cotabby independently validates request continuity, UTF-8 prefix, token
-prefix, and sampling compatibility before calling it.
+`trimKV` restores a prefix in slot zero and invalidates its pending seed/feedback token. Ordinary
+attention uses direct suffix removal. Recurrent, hybrid, and sliding-window models use one
+`PARTIAL_ONLY | ON_DEVICE` checkpoint near the prompt tail, retaining full attention KV in place.
+The checkpoint's tensor memory is capped at 128 MiB and restoration replays at most eight prompt
+tokens without sampling. Device storage belongs to the llama context's slot-zero checkpoint and
+is released when that context unloads. Checkpoint metadata belongs to `SequenceState`.
+
+A request that edits before the saved checkpoint, a very short prompt without a nonempty checkpoint,
+or a model exceeding the cap returns a cache miss; callers rebuild that request. A miss must not
+permanently disable reuse for the model. Saving a newer near-caret checkpoint intentionally gives
+up deeper backspace history. Gemma's sliding-window cache supports suffix removal, but restoring
+its saved window also protects rows evicted during prediction. No model-family-name heuristics
+are used: llama model metadata selects the partial-state path.
+
+`decodePrompt` resets the sampler and accepts only committed prompt tokens. Discarded predictions
+therefore never pollute penalties or RNG state; `llama_sampler_sample` already accepts its sample,
+so the wrapper must not accept it a second time. A sampled seed is not in KV until feedback decode.
+Every successful decode advances tracked positions even when the next result is EOS/cancelled.
+A failed native decode invalidates cache reuse until the sequence is destroyed; an unchanged
+tracked position must never make the equal-position trim shortcut certify uncertain memory.
+
+`getCacheDiagnostics(sequence)` exposes actual token position, checkpoint tensor bytes/position,
+restoration replay count, and whether partial checkpoints are required. It contains no text.
+Cotabby independently validates field continuity, byte/token prefix, and sampling compatibility.
 
 `cancelSequence` is thread-safe and nonblocking. Prompt decode checks cancellation between chunks;
 sample generation checks before work and after feedback decode. An active llama decode is not
-preempted mid-call. Cotabby destroys a natively cancelled sequence because the flag is intentionally
-one-way.
+preempted mid-call. Successful `trimKV` clears the cancellation flag only after memory is valid;
+a failed restoration leaves the sequence cancelled and requires destruction. Cotabby closes its
+operation-specific cancellation target before restoring, so a late task cancellation cannot poison
+the next request that reuses the same sequence. Destruction and cancellation serialize ownership
+through the sequence mutex.
 
 ## Testing
 
@@ -144,10 +186,31 @@ Run the full native path with a local GGUF:
 COTABBY_TEST_MODEL_PATH=/absolute/path/model.gguf swift test
 ~~~
 
+If the default Xcode-backed SwiftPM runner fails code signing because of local Finder metadata,
+`swift test --build-system native` runs the same tests with SwiftPM's native runner.
+
+Run the deterministic vocabulary-prefix tests without downloading a model or linking llama:
+
+~~~bash
+clang++ -std=c++17 -I Sources/CotabbyInferenceEngine \
+  Sources/CotabbyInferenceEngine/TokenHealing.cpp Tests/TokenHealingTests.cpp \
+  -o /tmp/cotabby-token-healing-tests
+/tmp/cotabby-token-healing-tests
+~~~
+
 The model-backed suite covers single-sequence admission/replacement, prompt decode, sampling, KV
 trim, cancellation, mid-word continuation, optional log-probability, scaffolding-token masking, and
 argmax-EOG behavior. CI does not currently provide a GGUF, so these tests skip there unless the
-environment variable is configured.
+environment variable is configured. New coverage compares cold/restored token output, cancellation
+rearming, exact replay of unfinished words and trailing whitespace, and checkpoint/replay bounds.
+An oversized-prompt regression also verifies failed-decode invalidation and fresh-sequence recovery.
+
+`testWarmPromptDecodeReportsLatency` prints medians for 32-, 214-, and 838-token prompts (the exact
+counts vary by tokenizer), excluding the first pass and asserting no wall-clock threshold. On one
+local Qwen3.5-0.8B-Base Q6_K run, cold/warm prompt processing measured about 40/26, 89/25, and 284/25
+milliseconds with a 20.2 MB checkpoint. This is native prompt work, not keystroke-to-visible-word
+latency, and is not a Gemma or cross-hardware speed claim. Host-memory checkpoints were slower in
+the same experiment; keeping tensor copies on device was necessary for the measured improvement.
 
 ## Requirements
 
