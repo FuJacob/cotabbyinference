@@ -1,0 +1,31 @@
+README.md
+  s_06b938d10fb9a9::t_540b5071f3d457 25,88,94-95,98-99,102-104,108-109,125-139,142-165,169-173,189-200,204-213
+Sources/CotabbyInferenceEngine/CotabbyInferenceEngine.cpp
+  s_06b938d10fb9a9::t_37b927abf90e2a 2,106-122,168-173,181,194-291,372,383,410-414,432,558-559,607,632,712-714,728-733,742-745,763,769-774,780-787,791-793,801,804,836-839,904-909,911,916-921,923-928,977-980,988-1003,1007,1013-1015,1028-1044,1058-1063,1086-1098
+Sources/CotabbyInferenceEngine/TokenHealing.cpp
+  s_06b938d10fb9a9::t_fbaef70482e7af 1-88
+Sources/CotabbyInferenceEngine/TokenHealing.h
+  s_06b938d10fb9a9::t_48597072f14c3c 1-55
+Sources/CotabbyInferenceEngine/include/CotabbyInferenceEngine.h
+  s_06b938d10fb9a9::t_03c65364f76674 43-51,76-80,111
+Tests/CotabbyInferenceTests/LlamaMiddlewareTests.swift
+  s_06b938d10fb9a9::t_30d1bc7bf56fb1 95-96,250-427,431-445
+Tests/TokenHealingTests.cpp
+  s_06b938d10fb9a9::t_c67201b94597c9 1-75
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "7e5dbae2fa96cdf72737fc105b2a352ae82a22e5",
+  "prompts": {},
+  "sessions": {
+    "s_06b938d10fb9a9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5f586376-e95f-4563-aa31-d389afd117c7",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Jacob Fu <141651335+FuJacob@users.noreply.github.com>"
+    }
+  }
+}
