@@ -1,0 +1,25 @@
+README.md
+  s_06b938d10fb9a9::t_a0ebbdcefb689d 143-146,155-159
+Sources/CotabbyInferenceEngine/CotabbyInferenceEngine.cpp
+  s_06b938d10fb9a9::t_61993e30a258b2 558-562,564,580-585,648-667
+Sources/CotabbyInferenceEngine/include/CotabbyInferenceEngine.h
+  s_06b938d10fb9a9::t_ffd97ddeca1f37 73-77
+Tests/CotabbyInferenceTests/LlamaMiddlewareTests.swift
+  s_06b938d10fb9a9::t_0fe13fb594103b 283-288,295,298-301
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "49ab6db6e57f0b0f0c2c74fdf659fbae8dc7069b",
+  "prompts": {},
+  "sessions": {
+    "s_06b938d10fb9a9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5f586376-e95f-4563-aa31-d389afd117c7",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Jacob Fu <141651335+FuJacob@users.noreply.github.com>"
+    }
+  }
+}
