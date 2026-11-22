@@ -140,7 +140,10 @@ that do not heal; sampler settings and cache lifetime do not imply the next requ
 ## KV Reuse and Cancellation
 
 `trimKV` restores a prefix in slot zero and invalidates its pending seed/feedback token. Ordinary
-attention uses direct suffix removal. Recurrent, hybrid, and sliding-window models use one
+and sliding-window attention use direct suffix removal: the context is created with `swa_full`,
+so the SWA cache has one cell per context position and never overwrites a row a later trim
+would need (a default-sized SWA cache keeps only `n_swa + n_ubatch` cells). Recurrent and hybrid
+models, whose recurrent state cannot be rewound by removing KV, use one
 `PARTIAL_ONLY | ON_DEVICE` checkpoint near the prompt tail, retaining full attention KV in place.
 The checkpoint's tensor memory is capped at 128 MiB and restoration replays at most eight prompt
 tokens without sampling. Device storage belongs to the llama context's slot-zero checkpoint and
@@ -149,9 +152,11 @@ is released when that context unloads. Checkpoint metadata belongs to `SequenceS
 A request that edits before the saved checkpoint, a very short prompt without a nonempty checkpoint,
 or a model exceeding the cap returns a cache miss; callers rebuild that request. A miss must not
 permanently disable reuse for the model. Saving a newer near-caret checkpoint intentionally gives
-up deeper backspace history. Gemma's sliding-window cache supports suffix removal, but restoring
-its saved window also protects rows evicted during prediction. No model-family-name heuristics
-are used: llama model metadata selects the partial-state path.
+up deeper backspace history. No model-family-name heuristics are used: llama model metadata
+selects the partial-state path.
+
+`updateSampling(sequence, config)` swaps the sampler chain of the live sequence without touching
+its KV, so a request whose sampling settings differ from the cached one still reuses the prompt.
 
 `decodePrompt` resets the sampler and accepts only committed prompt tokens. Discarded predictions
 therefore never pollute penalties or RNG state; `llama_sampler_sample` already accepts its sample,

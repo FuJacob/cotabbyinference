@@ -280,16 +280,25 @@ final class LlamaMiddlewareTests: XCTestCase {
 
     /// Greedy equivalence cannot detect a stale random stream. A fixed nonzero seed and positive
     /// temperature make this request exercise the distribution sampler across repeated restores.
+    ///
+    /// The cold baseline decodes the last prompt token in its own batch, as every restore below
+    /// does. Metal's logits differ in the last bits between batch shapes, and at this temperature a
+    /// near-tie late in the stream can flip on that alone (Gemma's sliding-window layers, trimmed in
+    /// place under `swa_full`, showed it at token 22). Matching the batch shape keeps this test about
+    /// what restoration must reset, the random stream and the repetition history.
     func testRestoredSeededSamplingMatchesColdGeneration() throws {
         var engine = CotabbyInferenceEngine()
         let modelPath = try Self.modelPath()
         XCTAssertEqual(engine.loadModel(modelPath, -1, 1024, 256), .ok)
         defer { engine.unloadModel() }
         let prompt = "Hi Alex, thanks for sending the project update. I will review the schedule and send you my"
-        var tokens = Array(engine.tokenize(prompt, Int32(prompt.utf8.count)))
+        let tokens = Array(engine.tokenize(prompt, Int32(prompt.utf8.count)))
         let config = Self.samplingConfig(temperature: 0.7, repetitionPenalty: 1.1, seed: 42)
         let sequence = engine.createSequence(config)
-        XCTAssertEqual(engine.decodePrompt(sequence, &tokens, Int32(tokens.count), 0), .ok)
+        var head = Array(tokens.dropLast())
+        XCTAssertEqual(engine.decodePrompt(sequence, &head, Int32(head.count), 0), .ok)
+        var tail = [tokens.last!]
+        XCTAssertEqual(engine.decodePrompt(sequence, &tail, 1, Int32(tokens.count - 1)), .ok)
         let cold = Self.sampleTokens(engine: &engine, sequence: sequence, count: 24)
         XCTAssertGreaterThan(cold.count, 1, "The test must advance the random stream beyond its seed sample")
 
