@@ -555,8 +555,13 @@ EngineStatus CotabbyInferenceEngine::loadModel(const char* path, int gpu_layers,
     impl_->context_window_tokens = context_window_tokens;
     impl_->batch_size = batch_size;
     impl_->gpu_layer_count = gpu_layers;
+    // Only recurrent state cannot be rewound by removing a KV suffix. Sliding-window attention
+    // can, provided its cache keeps every position (`swa_full` below); a default-sized SWA cache
+    // holds only n_swa + n_ubatch cells and overwrites older ones, which is what used to force
+    // SWA models such as Gemma onto the eight-token checkpoint path and a full prompt re-decode
+    // after nearly every keystroke.
     impl_->needs_prompt_checkpoint = llama_model_is_recurrent(impl_->model) ||
-        llama_model_is_hybrid(impl_->model) || llama_model_n_swa(impl_->model) > 0;
+        llama_model_is_hybrid(impl_->model);
     // Performance cores only — see resolveDecodeThreadCount. hardware_concurrency() counted
     // every logical core including efficiency cores, which both slows barriered matmuls and
     // burns extra package power for nothing when layers are Metal-offloaded anyway.
@@ -572,6 +577,12 @@ EngineStatus CotabbyInferenceEngine::loadModel(const char* path, int gpu_layers,
     ctx_params.n_threads = static_cast<int32_t>(impl_->thread_count);
     ctx_params.n_threads_batch = static_cast<int32_t>(impl_->thread_count);
     ctx_params.offload_kqv = true;
+    // Size the sliding-window cache like the full-attention cache so no position inside the
+    // context window is ever overwritten. That keeps `llama_memory_seq_rm` suffix trims valid for
+    // SWA models, which is what lets each keystroke decode only its changed tail. The cost is KV
+    // memory proportional to n_ctx for the SWA layers; Cotabby's single 4K sequence keeps that
+    // bounded. Models without SWA layers ignore the flag.
+    ctx_params.swa_full = true;
 
     impl_->shared_ctx = llama_init_from_model(impl_->model, ctx_params);
     if (!impl_->shared_ctx) {
@@ -632,6 +643,26 @@ int32_t CotabbyInferenceEngine::createSequence(SamplingConfig config) {
     state->single_line = config.single_line;
     impl_->sequence = std::move(state);
     return id;
+}
+
+bool CotabbyInferenceEngine::updateSampling(int32_t sequence_id, SamplingConfig config) {
+    if (!impl_ || !impl_->model || !impl_->shared_ctx) return false;
+    llama_sampler* sampler = impl_->buildSampler(config);
+    if (!sampler) return false;
+
+    // Hold the context lock as well: sampleNext reads the sampler under decode_mutex, so swapping
+    // it here can never race a token being sampled by an in-flight generation.
+    std::lock_guard<std::mutex> sequence_lock(impl_->sequence_mutex);
+    std::lock_guard<std::mutex> decode_lock(impl_->decode_mutex);
+    if (!impl_->sequence || impl_->sequence->external_id != sequence_id) {
+        llama_sampler_free(sampler);
+        return false;
+    }
+    SequenceState& seq = *impl_->sequence;
+    if (seq.sampler) llama_sampler_free(seq.sampler);
+    seq.sampler = sampler;
+    seq.single_line = config.single_line;
+    return true;
 }
 
 void CotabbyInferenceEngine::destroySequence(int32_t sequence_id) {

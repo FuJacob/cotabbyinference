@@ -70,6 +70,11 @@ public:
     // alive; destroy the current sequence before creating its replacement.
     int32_t createSequence(SamplingConfig config);
     void destroySequence(int32_t sequence_id);
+    // Replaces the live sequence's sampler chain while keeping its KV cache. Sampler state never
+    // depends on KV contents: decodePrompt resets it and re-accepts the prompt tokens, so a
+    // changed temperature/top-k/single-line request can reuse the cached prompt instead of
+    // destroying it. Returns false when the sequence is unknown or the chain cannot be built.
+    bool updateSampling(int32_t sequence_id, SamplingConfig config);
 
     // Tokenization (thread-safe, read-only on vocab)
     std::vector<int32_t> tokenize(const char* text, int text_length) const;
